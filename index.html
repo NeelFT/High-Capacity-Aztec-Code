@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Color Fountain Transfer</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; background: #000; color: #fff; }
+    main { display: grid; justify-items: center; gap: 12px; padding: 20px; }
+    .tabs, .controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    button, input { min-height: 38px; padding: 7px 12px; border-radius: 6px; font: inherit; }
+    button { border: 0; background: #fff; color: #000; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .tabs button { background: #252525; color: #fff; }
+    .tabs button.active { background: #fff; color: #000; }
+    .protocols { display: flex; gap: 6px; justify-content: center; }
+    .protocols button { background: #252525; color: #fff; }
+    .protocols button.active { background: #fff; color: #000; }
+    .panel { width: min(100%, 760px); display: grid; justify-items: center; gap: 10px; }
+    .meta { min-height: 22px; text-align: center; }
+    .telemetry { color: #7fffd4; font-family: ui-monospace, monospace; font-size: .85rem; }
+    #tx { display: block; width: min(92vw, 570px); height: min(92vw, 570px); max-width: 100%; background: #fff; image-rendering: pixelated; }
+    #camera { width: min(100%, 720px); background: #111; }
+    #receivePreview img, #receivePreview video { max-width: min(100%, 480px); max-height: 55vh; }
+    #scanCanvas { display: none; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <nav class="tabs" aria-label="Transfer mode">
+      <button id="sendTab" class="active" type="button" aria-selected="true">Send</button>
+      <button id="receiveTab" type="button" aria-selected="false">Receive</button>
+    </nav>
+    <div class="protocols" aria-label="Matrix size">
+      <label for="targetMatrixSize">Matrix size</label>
+      <select id="targetMatrixSize">
+        <option value="63" selected>63 x 63</option>
+        <option value="95">95 x 95</option>
+      </select>
+      <span>custom scalable color fountain stream</span>
+    </div>
+
+    <section id="sendPanel" class="panel" aria-labelledby="sendTab">
+      <div class="controls">
+        <input type="file" id="fileInput" aria-label="Choose file">
+        <button id="sendButton" type="button" disabled>Send</button>
+      </div>
+      <div id="sendStatus" class="meta">Choose a file</div>
+      <div id="frameCount" class="meta"></div>
+      <div id="sendFileName" class="meta"></div>
+      <div id="transmitTelemetry" class="meta telemetry">0 data bits | 0 padded modules | 0 rings</div>
+      <canvas id="tx" aria-label="Current scalable color transfer frame"></canvas>
+    </section>
+
+    <section id="receivePanel" class="panel" aria-labelledby="receiveTab" hidden>
+      <video id="camera" playsinline muted></video>
+      <label for="zoomSlider">Camera zoom
+        <input id="zoomSlider" type="range" min="1" max="1" step="0.1" value="1" disabled>
+      </label>
+      <button id="startButton" type="button">Start camera</button>
+      <div id="receiveStatus" class="meta">Ready - press Start camera; scans calibrated color packets</div>
+      <div class="meta">Mobile Chrome requires HTTPS for camera access.</div>
+      <div id="receiveProgress" class="meta"></div>
+      <div id="receiveFileName" class="meta"></div>
+      <div id="transferComplete" class="meta complete" hidden>Transfer Complete</div>
+      <div id="receivePreview"></div>
+      <button id="saveButton" type="button" hidden>Save file</button>
+    </section>
+  </main>
+  <canvas id="scanCanvas"></canvas>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
