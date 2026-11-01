@@ -637,7 +637,7 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
         }
         if (frameId === 0) {
           let bestSpread = dataPaletteSpread(packet, layout);
-          let bestPacket = packet;
+          let bestPacket = packet.slice();
           for (let attempt = 0; attempt < 15; attempt += 1) {
             writeU32(view, 8, randomU32());
             const checksumOffset = packet.length - 4;
