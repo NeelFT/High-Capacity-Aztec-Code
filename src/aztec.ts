@@ -538,6 +538,24 @@ function framePayloadSize(layout: AztecLayout, metadataLength: number): number {
   return available;
 }
 
+function hasFullDataPalette(packet: Uint8Array, layout: AztecLayout): boolean {
+  const symbols = encode3BitPayload(packet);
+  const frameId = packet.length >= 4 ? readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), 0) : 0;
+  let paletteMask = 0;
+  for (let index = 0; index < layout.dataCoordinates.length; index += 1) {
+    let symbol = symbols[index] ?? 0;
+    if (index >= symbols.length) {
+      let state = (frameId ^ Math.imul(index + 1, 0x9e3779b9)) >>> 0;
+      state = (Math.imul(state ^ (state >>> 16), 0x45d9f3b) + 0x27100001) >>> 0;
+      state ^= state >>> 13;
+      symbol = state & 0x7;
+    }
+    paletteMask |= 1 << ((symbol ^ colorSymbolMask(index)) & 0x7);
+    if (paletteMask === 0xff) return true;
+  }
+  return false;
+}
+
 export function prepareAztecTransfer(file: File, targetMatrixSize: number, onProgress?: (current: number, total: number) => void): Promise<PreparedAztecTransfer> {
   return new Promise(async (resolve, reject) => {
     try {
@@ -570,38 +588,43 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
       const packets: Uint8Array[] = [];
       const totalPackets = blockCount + Math.max(1, Math.ceil(blockCount * REDUNDANCY));
       for (let frameId = 0; frameId < totalPackets; frameId += 1) {
-        const seed = randomU32();
-        const indices = frameId < blockCount ? [frameId] : chooseSubset(seed, blockCount);
-        const payload = new Uint8Array(blockSize);
-        for (const index of indices) xorInto(payload, blocks[index]);
-        const packetMetadata = frameId === 0
-          ? metadata
-          : new Uint8Array([0]);
-        const packetLength = PACKET_FIXED_BYTES + indices.length * 2 + packetMetadata.length + blockSize + 4;
-        const packet = new Uint8Array(packetLength);
-        const view = new DataView(packet.buffer);
-        writeU32(view, 0, frameId);
-        writeU32(view, 4, file.size);
-        writeU32(view, 8, seed);
-        writeU32(view, HEADER_BYTES, session);
-        writeU16(view, HEADER_BYTES + 4, blockCount);
-        writeU16(view, HEADER_BYTES + 6, blockSize);
-        packet[HEADER_BYTES + 8] = indices.length;
-        let offset = HEADER_BYTES + 9;
-        for (const index of indices) {
-          writeU16(view, offset, index);
-          offset += 2;
+        let packet: Uint8Array | null = null;
+        for (let attempt = 0; attempt < 128 && !packet; attempt += 1) {
+          const seed = randomU32();
+          const indices = frameId < blockCount ? [frameId] : chooseSubset(seed, blockCount);
+          const payload = new Uint8Array(blockSize);
+          for (const index of indices) xorInto(payload, blocks[index]);
+          const packetMetadata = frameId === 0
+            ? metadata
+            : new Uint8Array([0]);
+          const packetLength = PACKET_FIXED_BYTES + indices.length * 2 + packetMetadata.length + blockSize + 4;
+          const candidate = new Uint8Array(packetLength);
+          const view = new DataView(candidate.buffer);
+          writeU32(view, 0, frameId);
+          writeU32(view, 4, file.size);
+          writeU32(view, 8, seed);
+          writeU32(view, HEADER_BYTES, session);
+          writeU16(view, HEADER_BYTES + 4, blockCount);
+          writeU16(view, HEADER_BYTES + 6, blockSize);
+          candidate[HEADER_BYTES + 8] = indices.length;
+          let offset = HEADER_BYTES + 9;
+          for (const index of indices) {
+            writeU16(view, offset, index);
+            offset += 2;
+          }
+          candidate[offset++] = packetMetadata.length;
+          candidate.set(packetMetadata, offset);
+          offset += packetMetadata.length;
+          candidate.set(payload, offset);
+          offset += payload.length;
+          writeU32(view, offset, crc32(candidate.subarray(0, offset)));
+          offset += 4;
+          if (offset !== candidate.length) {
+            throw new Error('Fountain packet layout calculation failed.');
+          }
+          if (hasFullDataPalette(candidate, layout)) packet = candidate;
         }
-        packet[offset++] = packetMetadata.length;
-        packet.set(packetMetadata, offset);
-        offset += packetMetadata.length;
-        packet.set(payload, offset);
-        offset += payload.length;
-        writeU32(view, offset, crc32(packet.subarray(0, offset)));
-        offset += 4;
-        if (offset !== packet.length) {
-          throw new Error('Fountain packet layout calculation failed.');
-        }
+        if (!packet) throw new Error(`Could not generate frame ${frameId} with all eight data colours after 128 attempts.`);
         packets.push(packet);
       }
       resolve({ file, session, totalBytes: file.size, blockCount, blockSize, packets, frameCount: packets.length, targetMatrixSize: layout.targetMatrixSize });

@@ -285,14 +285,20 @@ test('32x32 and 63x63 layouts share a centered fixed-size finder and disjoint da
 test('32x32 frames carry and decode valid packets while 24x24 remains below protocol capacity', async () => {
   const file = new File([new TextEncoder().encode('HCAC test')], 'hcac-self-test.txt', { type: 'text/plain' });
   const transfer = await prepareAztecTransfer(file, 32);
+  const layout = createAztecLayout(32);
   assert.equal(transfer.targetMatrixSize, 32);
   assert.equal(transfer.blockCount, 1, 'the 32x32 decoder self-test must fit in one frame');
   assert.equal(createAztecLayout(32).frameSize, 216);
   assert.equal(renderAztecFrameMatrix(transfer.packets[0], 32).length, 32 * 32);
+  for (const packet of transfer.packets) {
+    const matrix = renderAztecFrameMatrix(packet, 32);
+    const dataPalette = new Set(layout.dataCoordinates.map(([x, y]) => matrix[y * 32 + x]));
+    assert.equal(dataPalette.size, COLORS.length, 'every frame data area must contain all eight colors');
+    const trace = decodeOpticalFrameDetailed(makeRenderedImage(packet, 32), 32);
+    assert.equal(trace.status, 'packet-decoded', trace.reason);
+    assert.deepStrictEqual(trace.packet, packet);
+  }
   assert.ok(transfer.blockSize > 0);
-  const trace = decodeOpticalFrameDetailed(makeRenderedImage(transfer.packets[0], 32), 32);
-  assert.equal(trace.status, 'packet-decoded', trace.reason);
-  assert.deepStrictEqual(trace.packet, transfer.packets[0]);
 
   assert.equal(Math.floor(createAztecLayout(24).dataCoordinates.length * 3 / 8), 79);
   await assert.rejects(prepareAztecTransfer(file, 24), /cannot fit a safe fountain packet/);
@@ -301,8 +307,12 @@ test('32x32 frames carry and decode valid packets while 24x24 remains below prot
 test('actual sender render decodes in the receiver pipeline at varied brightness', async () => {
   const transfer = await prepareAztecTransfer(new File([makePayload(128, 77)], 'self-test.bin'), 63);
   const image = makeRenderedImage(transfer.packets[0], transfer.targetMatrixSize);
-  const palette = new Set(renderAztecFrameMatrix(transfer.packets[0], transfer.targetMatrixSize));
-  assert.equal(palette.size, 8, 'the rendered frame must contain every protocol palette colour');
+  const layout = createAztecLayout(transfer.targetMatrixSize);
+  for (const packet of transfer.packets) {
+    const matrix = renderAztecFrameMatrix(packet, transfer.targetMatrixSize);
+    const dataPalette = new Set(layout.dataCoordinates.map(([x, y]) => matrix[y * transfer.targetMatrixSize + x]));
+    assert.equal(dataPalette.size, COLORS.length, 'every frame data area must contain all eight colors');
+  }
   for (const brightness of [0.7, 1, 1.15]) {
     const trace = decodeOpticalFrameDetailed(scaleBrightness(image, brightness), transfer.targetMatrixSize);
     assert.equal(trace.status, 'packet-decoded', `decoder failed at brightness multiplier ${brightness}: ${trace.reason}`);
