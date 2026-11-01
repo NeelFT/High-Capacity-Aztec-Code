@@ -28,6 +28,8 @@ Open the local HTTPS address printed by Vite. The receiver uses the browser came
 
 The sender includes the original blocks plus repair packets, then repeats the sequence. That gives the receiver another chance to collect missing data if a frame is blurred or missed. A steady, bright screen, a focused camera, and low glare help. Keep the whole frame visible and large in the camera preview; use the camera zoom control if the browser/device offers it. Camera permission requires HTTPS (or localhost), and some mobile browsers restrict camera access when the page is opened from an insecure LAN address.
 
+The visual layout uses a centered, one-module alternating-ring bullseye: 8 x 8 modules for the even 32 x 32 matrix and 9 x 9 for the odd 63 x 63 matrix. The one-module parity difference keeps both finders exactly centered on the module grid. Alignment tracks are outside the finder, and the renderer and decoder share the same matrix geometry and two-module white quiet zone.
+
 ## Diagnose and test the receiver
 
 The Receive panel reports camera frames, candidate regions, geometry/orientation, sampled colors, header/CRC results, accepted packets, recovered blocks, and final SHA-256 verification. Its preview overlays candidate corners and the estimated grid; the latest decoder error is shown separately.

@@ -21,6 +21,7 @@ export type WorkerDiagnostics = {
   uniqueBlocks: number;
   lastPacketId: number | null;
   lastDetectionTimestamp: number | null;
+  trackingState: 'SEARCHING' | 'CANDIDATE_FOUND' | 'GEOMETRY_VALIDATED' | 'LOCKED' | 'TRACKING' | 'TRACKING_LOST' | 'REACQUIRING';
   verification: 'WAITING' | 'IN_PROGRESS' | 'VERIFIED' | 'FAILED';
   latestError: string | null;
 };

@@ -1,4 +1,6 @@
-export const FINDER_SIZE = 15;
+export const FINDER_SIZE = 9;
+export const EVEN_FINDER_SIZE = FINDER_SIZE - 1;
+export const FINDER_RING_THICKNESS = 1;
 export const MODULE_PIXELS = 6;
 export const QUIET_ZONE_MODULES = 2;
 export const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF', '#FFFFFF'] as const;
@@ -16,6 +18,9 @@ export interface AztecLayout {
   targetMatrixSize: number;
   frameSize: number;
   matrixOffset: number;
+  finderCenter: number;
+  finderStart: number;
+  finderSize: number;
   dataCoordinates: Array<[number, number]>;
   alignmentCoordinates: Set<string>;
   grid: Array<Array<string | null>>;
@@ -454,7 +459,8 @@ function validateMatrixSize(targetMatrixSize: number): number {
 export function createAztecLayout(targetMatrixSize: number): AztecLayout {
   const size = validateMatrixSize(targetMatrixSize);
   const center = Math.floor(size / 2);
-  const finderStart = center - Math.floor(FINDER_SIZE / 2);
+  const finderSize = size % 2 === 0 ? EVEN_FINDER_SIZE : FINDER_SIZE;
+  const finderStart = (size - finderSize) / 2;
   const grid: Array<Array<string | null>> = Array.from({ length: size }, () => Array<string | null>(size).fill(null));
   const alignmentCoordinates = new Set<string>();
   const setStructural = (x: number, y: number, color: string): void => {
@@ -471,10 +477,10 @@ export function createAztecLayout(targetMatrixSize: number): AztecLayout {
       setStructural(size - 1 - edge, index, '#000000');
     }
   }
-  for (let y = finderStart; y < finderStart + FINDER_SIZE; y += 1) {
-    for (let x = finderStart; x < finderStart + FINDER_SIZE; x += 1) {
-      const edge = Math.min(x - finderStart, y - finderStart, finderStart + FINDER_SIZE - 1 - x, finderStart + FINDER_SIZE - 1 - y);
-      setStructural(x, y, edge % 2 === 0 || (x === center && y === center) ? '#000000' : '#FFFFFF');
+  for (let y = finderStart; y < finderStart + finderSize; y += 1) {
+    for (let x = finderStart; x < finderStart + finderSize; x += 1) {
+      const edge = Math.min(x - finderStart, y - finderStart, finderStart + finderSize - 1 - x, finderStart + finderSize - 1 - y);
+      setStructural(x, y, Math.floor(edge / FINDER_RING_THICKNESS) % 2 === 0 ? '#000000' : '#FFFFFF');
     }
   }
   const alignmentTrack = [10, size - 11];
@@ -506,6 +512,9 @@ export function createAztecLayout(targetMatrixSize: number): AztecLayout {
     targetMatrixSize: size,
     frameSize: (size + QUIET_ZONE_MODULES * 2) * MODULE_PIXELS,
     matrixOffset,
+    finderCenter: size / 2,
+    finderStart,
+    finderSize,
     dataCoordinates,
     alignmentCoordinates,
     grid,
@@ -600,15 +609,6 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
       reject(error);
     }
   });
-}
-
-function isFinder(x: number, y: number, targetMatrixSize: number): boolean {
-  const start = Math.floor((targetMatrixSize - FINDER_SIZE) / 2);
-  const localX = x - start;
-  const localY = y - start;
-  if (localX < 0 || localY < 0 || localX >= FINDER_SIZE || localY >= FINDER_SIZE) return false;
-  const edge = Math.min(localX, localY, FINDER_SIZE - 1 - localX, FINDER_SIZE - 1 - localY);
-  return edge % 2 === 0 || (edge === 6 && localX >= 4 && localX <= 10 && localY >= 4 && localY <= 10);
 }
 
 function isPalette(x: number, y: number): boolean {

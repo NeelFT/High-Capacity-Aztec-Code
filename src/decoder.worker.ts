@@ -13,6 +13,9 @@ let totalBytes = 0;
 let metadata: { name: string; type: string; hash: string } | null = null;
 let targetMatrixSize = 63;
 let lastCorners: FrameCorners | null = null;
+let trackedImageSize: [number, number] | null = null;
+let trackingMisses = 0;
+let trackingFrames = 0;
 let latestTrace: DecoderTrace | null = null;
 const diagnosticCounts: WorkerDiagnostics = {
   frames: 0,
@@ -30,6 +33,7 @@ const diagnosticCounts: WorkerDiagnostics = {
   uniqueBlocks: 0,
   lastPacketId: null,
   lastDetectionTimestamp: null,
+  trackingState: 'SEARCHING',
   verification: 'WAITING',
   latestError: null,
 };
@@ -61,8 +65,73 @@ function resetDiagnostics(): void {
   diagnosticCounts.uniqueBlocks = 0;
   diagnosticCounts.lastPacketId = null;
   diagnosticCounts.lastDetectionTimestamp = null;
+  diagnosticCounts.trackingState = 'SEARCHING';
   diagnosticCounts.verification = 'WAITING';
   diagnosticCounts.latestError = null;
+}
+
+function updateTracking(trace: DecoderTrace): void {
+  const validTrack = trace.geometryCandidates > 0 && trace.orientationFound;
+  if (trace.candidateCount === 0) {
+    if (trace.trackedCandidate && validTrack) {
+      trackingMisses = 0;
+      trackingFrames += 1;
+      diagnosticCounts.trackingState = trackingFrames < 3 ? 'LOCKED' : 'TRACKING';
+      rememberCorners(trace);
+      return;
+    }
+    trackingMisses += 1;
+    trackingFrames = 0;
+    if (!lastCorners || trackingMisses > 4) {
+      lastCorners = null;
+      trackedImageSize = null;
+      diagnosticCounts.trackingState = 'SEARCHING';
+    } else {
+      diagnosticCounts.trackingState = trackingMisses === 1 ? 'TRACKING_LOST' : 'REACQUIRING';
+    }
+    return;
+  }
+
+  const wasReacquiring = trackingMisses > 0;
+  trackingMisses = 0;
+  if (!trace.geometryCandidates) {
+    trackingFrames = 0;
+    diagnosticCounts.trackingState = 'CANDIDATE_FOUND';
+    return;
+  }
+  if (!trace.orientationFound) {
+    trackingFrames = 0;
+    diagnosticCounts.trackingState = 'GEOMETRY_VALIDATED';
+    return;
+  }
+
+  trackingFrames += 1;
+  if (wasReacquiring) {
+    trackingFrames = 1;
+    diagnosticCounts.trackingState = 'REACQUIRING';
+  } else {
+    diagnosticCounts.trackingState = trackingFrames < 3 ? 'LOCKED' : 'TRACKING';
+  }
+  rememberCorners(trace);
+}
+
+function rememberCorners(trace: DecoderTrace): void {
+  if (!trace.corners) return;
+  if (lastCorners && trackedImageSize?.[0] === trace.imageWidth && trackedImageSize[1] === trace.imageHeight) {
+    const maxDistance = Math.min(trace.imageWidth, trace.imageHeight) * 0.2;
+    if (trace.corners.every((point, index) =>
+      Math.hypot(point.x - lastCorners![index].x, point.y - lastCorners![index].y) <= maxDistance)) {
+      lastCorners = trace.corners.map((point, index) => ({
+        x: lastCorners![index].x * 0.65 + point.x * 0.35,
+        y: lastCorners![index].y * 0.65 + point.y * 0.35,
+      })) as FrameCorners;
+    } else {
+      lastCorners = trace.corners;
+    }
+  } else {
+    lastCorners = trace.corners;
+  }
+  trackedImageSize = [trace.imageWidth, trace.imageHeight];
 }
 
 function updateTrace(trace: DecoderTrace): void {
@@ -70,7 +139,7 @@ function updateTrace(trace: DecoderTrace): void {
   if (trace.geometryCandidates > 0) diagnosticCounts.validGeometry += trace.geometryCandidates;
   if (trace.orientationFound) {
     diagnosticCounts.orientationsFound += 1;
-    diagnosticCounts.lastDetectionTimestamp = Date.now();
+    if (!trace.trackedCandidate) diagnosticCounts.lastDetectionTimestamp = Date.now();
   }
   if (trace.gridSampled) diagnosticCounts.gridsSampled += 1;
   if (trace.headerValid === true) diagnosticCounts.headerValidations += 1;
@@ -207,14 +276,21 @@ async function publish(image: PixelImage): Promise<void> {
   diagnosticCounts.frames += 1;
   diagnosticCounts.pixels += image.width * image.height;
   if (completionSent) return;
-  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, lastCorners);
+  if (trackedImageSize && (trackedImageSize[0] !== image.width || trackedImageSize[1] !== image.height)) {
+    lastCorners = null;
+    trackedImageSize = null;
+    trackingMisses = 0;
+    trackingFrames = 0;
+  }
+  const trackedCorners = trackingMisses < 3 ? lastCorners : null;
+  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, trackedCorners);
   latestTrace = trace;
+  updateTracking(trace);
   updateTrace(trace);
   if (!trace.packet) {
     reportDiagnostic(trace);
     return;
   }
-  if (trace.corners) lastCorners = trace.corners;
   const parsed = parsePacket(trace.packet);
   if (!parsed) {
     rejectPacket(trace, 'Decoded packet failed structural header validation (size, block count, indices, or payload length).', true);
@@ -286,6 +362,9 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     resetSession(0);
     lastSession = null;
     lastCorners = null;
+    trackedImageSize = null;
+    trackingMisses = 0;
+    trackingFrames = 0;
     return;
   }
   if (event.data.type === 'start') {
@@ -293,6 +372,9 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     resetSession(0);
     lastSession = null;
     lastCorners = null;
+    trackedImageSize = null;
+    trackingMisses = 0;
+    trackingFrames = 0;
     latestTrace = null;
     resetDiagnostics();
     running = true;

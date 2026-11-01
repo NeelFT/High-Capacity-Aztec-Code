@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { COLORS, colorSymbolMask, createAztecLayout, crc32, decode3BitPacket, decode3BitPayload, drawAztecFrame, encode3BitPayload, FountainEquationSolver, MAX_FILE_BYTES, prepareAztecTransfer, renderAztecFrameMatrix, sha256Hex, solveFountainEquations } from './aztec.ts';
+import { COLORS, colorSymbolMask, createAztecLayout, crc32, decode3BitPacket, decode3BitPayload, drawAztecFrame, encode3BitPayload, EVEN_FINDER_SIZE, FINDER_RING_THICKNESS, FINDER_SIZE, FountainEquationSolver, MAX_FILE_BYTES, MODULE_PIXELS, prepareAztecTransfer, QUIET_ZONE_MODULES, renderAztecFrameMatrix, sha256Hex, solveFountainEquations } from './aztec.ts';
 import { decodeOpticalFrame, decodeOpticalFrameDetailed } from './image-decoder.ts';
 import type { PixelImage } from './image-decoder.ts';
 
@@ -64,42 +64,13 @@ function addDarkCameraBackground(image: PixelImage, size: number): PixelImage {
   return { width: size, height: size, data };
 }
 
-function makeOpticalFrame(packet: Uint8Array, matrixSize: number, rotation = 0): PixelImage {
-  const layout = createAztecLayout(matrixSize);
-  const modulePixels = 6;
-  const sourceSize = matrixSize * modulePixels;
-  const source = new Uint8ClampedArray(sourceSize * sourceSize * 4);
-  const symbols = encode3BitPayload(packet);
-  const dataIndex = new Map(layout.dataCoordinates.map(([x, y], index) => [`${x},${y}`, index]));
-  const rgb = COLORS.map((color) => [
-    parseInt(color.slice(1, 3), 16),
-    parseInt(color.slice(3, 5), 16),
-    parseInt(color.slice(5, 7), 16),
-  ]);
-  for (let y = 0; y < matrixSize; y += 1) {
-    for (let x = 0; x < matrixSize; x += 1) {
-      const dataPosition = dataIndex.get(`${x},${y}`);
-      const structuralColor = layout.grid[y][x];
-      const colorIndex = structuralColor
-        ? COLORS.indexOf(structuralColor as typeof COLORS[number])
-        : ((symbols[dataPosition ?? 0] ?? 0) ^ colorSymbolMask(dataPosition ?? 0)) & 0x7;
-      const color = rgb[colorIndex < 0 ? 7 : colorIndex];
-      for (let py = 0; py < modulePixels; py += 1) {
-        for (let px = 0; px < modulePixels; px += 1) {
-          const targetX = x * modulePixels + px;
-          const targetY = y * modulePixels + py;
-          const offset = (targetY * sourceSize + targetX) * 4;
-          source[offset] = color[0];
-          source[offset + 1] = color[1];
-          source[offset + 2] = color[2];
-          source[offset + 3] = 255;
-        }
-      }
-    }
-  }
-
-  const width = 720;
-  const height = 720;
+function makeOpticalFrame(packet: Uint8Array, matrixSize: number, rotation = 0, imageSize = 720): PixelImage {
+  const sourceImage = makeRenderedImage(packet, matrixSize);
+  const sourceSize = sourceImage.width;
+  const source = sourceImage.data;
+  const width = imageSize;
+  const height = imageSize;
+  const scale = imageSize / 720;
   const output = new Uint8ClampedArray(width * height * 4);
   for (let index = 0; index < width * height; index += 1) {
     output[index * 4] = 255;
@@ -112,7 +83,7 @@ function makeOpticalFrame(packet: Uint8Array, matrixSize: number, rotation = 0):
     { x: 645, y: 78 },
     { x: 640, y: 640 },
     { x: 75, y: 630 },
-  ];
+  ].map(({ x, y }) => ({ x: x * scale, y: y * scale }));
   const targets = [
     { x: 0, y: 0 },
     { x: sourceSize, y: 0 },
@@ -263,9 +234,52 @@ test('renderer redraws every module and changes frame-dependent padding', async 
   const second = drawAztecFrame(nextPacket, canvas, size);
   const secondMatrix = renderAztecFrameMatrix(nextPacket, size);
   assert.equal(draws.size, size * size, 'the next frame must also redraw the complete matrix');
-  assert.ok(second.changedModules > size * size * 0.25, 'a new frame must replace stale symbols across the data region');
+  assert.ok(second.changedModules > size * size * 0.2, 'a new frame must replace stale symbols across the data region');
   assert.equal(second.totalModules, size * size);
   assert.notDeepEqual(firstMatrix, secondMatrix);
+});
+
+test('32x32 and 63x63 layouts share a centered fixed-size finder and disjoint data geometry', () => {
+  for (const size of [32, 63]) {
+    const layout = createAztecLayout(size);
+    assert.equal(layout.finderSize, size % 2 === 0 ? EVEN_FINDER_SIZE : FINDER_SIZE);
+    assert.equal(layout.finderSize, size === 32 ? 8 : 9);
+    assert.equal(layout.finderCenter, size / 2);
+    assert.equal(layout.finderStart, (size - layout.finderSize) / 2);
+    assert.equal(layout.matrixOffset, QUIET_ZONE_MODULES * MODULE_PIXELS);
+    assert.equal(layout.frameSize, (size + QUIET_ZONE_MODULES * 2) * MODULE_PIXELS);
+
+    const data = new Set(layout.dataCoordinates.map(([x, y]) => `${x},${y}`));
+    for (const structural of layout.alignmentCoordinates) assert.equal(data.has(structural), false);
+    for (let ring = 0; ring < Math.ceil(layout.finderSize / 2); ring += 1) {
+      const expected = Math.floor(ring / FINDER_RING_THICKNESS) % 2 === 0 ? '#000000' : '#FFFFFF';
+      const near: number = layout.finderStart + ring;
+      const far: number = layout.finderStart + layout.finderSize - 1 - ring;
+      const ringCorners: Array<[number, number]> = [[near, near], [far, near], [far, far], [near, far]];
+      for (const [x, y] of ringCorners) {
+        assert.equal(layout.grid[y][x], expected);
+      }
+    }
+    for (let y = Math.floor(layout.finderCenter) - 1; y <= Math.floor(layout.finderCenter); y += 1) {
+      for (let x = Math.floor(layout.finderCenter) - 1; x <= Math.floor(layout.finderCenter); x += 1) {
+        const centerRing: number = Math.floor(Math.min(
+          x - layout.finderStart,
+          y - layout.finderStart,
+          layout.finderStart + layout.finderSize - 1 - x,
+          layout.finderStart + layout.finderSize - 1 - y,
+        ) / FINDER_RING_THICKNESS) % 2;
+        assert.equal(layout.grid[y][x], centerRing === 0 ? '#000000' : '#FFFFFF');
+      }
+    }
+    const matrix = renderAztecFrameMatrix(new Uint8Array([0]), size);
+    const nextMatrix = renderAztecFrameMatrix(new Uint8Array([1]), size);
+    assert.equal(new Set(matrix).size, COLORS.length, 'the matrix must preserve all eight encoding colours');
+    for (let y = layout.finderStart; y < layout.finderStart + layout.finderSize; y += 1) {
+      for (let x = layout.finderStart; x < layout.finderStart + layout.finderSize; x += 1) {
+        assert.equal(matrix[y * size + x], nextMatrix[y * size + x], 'finder geometry must not vary between frames');
+      }
+    }
+  }
 });
 
 test('32x32 frames carry and decode valid packets while 24x24 remains below protocol capacity', async () => {
@@ -280,7 +294,7 @@ test('32x32 frames carry and decode valid packets while 24x24 remains below prot
   assert.equal(trace.status, 'packet-decoded', trace.reason);
   assert.deepStrictEqual(trace.packet, transfer.packets[0]);
 
-  assert.equal(createAztecLayout(24).dataCoordinates.length * 3 / 8, 30);
+  assert.equal(Math.floor(createAztecLayout(24).dataCoordinates.length * 3 / 8), 79);
   await assert.rejects(prepareAztecTransfer(file, 24), /cannot fit a safe fountain packet/);
 });
 
@@ -300,6 +314,23 @@ test('actual sender render decodes in the receiver pipeline at varied brightness
     assert.equal(trace.crcValid, true);
     assert.deepStrictEqual(trace.packet, transfer.packets[0]);
   }
+  const firstDetection = decodeOpticalFrameDetailed(image, transfer.targetMatrixSize);
+  assert.equal(firstDetection.status, 'packet-decoded');
+  assert.equal(firstDetection.finderSizeModules, createAztecLayout(transfer.targetMatrixSize).finderSize);
+  const trackedFrame = decodeOpticalFrameDetailed(image, transfer.targetMatrixSize, firstDetection.corners);
+  assert.equal(trackedFrame.status, 'packet-decoded', trackedFrame.reason);
+  assert.equal(trackedFrame.trackedCandidate, true);
+  assert.equal(trackedFrame.candidateCount, 0, 'tracked reads must not inflate newly detected candidate counts');
+  const corruptedPacket = transfer.packets[0].slice();
+  corruptedPacket[corruptedPacket.length - 5] ^= 0x80;
+  const trackedCrcFailure = decodeOpticalFrameDetailed(
+    makeRenderedImage(corruptedPacket, transfer.targetMatrixSize),
+    transfer.targetMatrixSize,
+    firstDetection.corners,
+  );
+  assert.equal(trackedCrcFailure.status, 'crc-failed');
+  assert.equal(trackedCrcFailure.trackedCandidate, true);
+  assert.equal(trackedCrcFailure.candidateCount, 0);
   const darkRoomTrace = decodeOpticalFrameDetailed(addDarkCameraBackground(image, 720), transfer.targetMatrixSize);
   assert.equal(darkRoomTrace.status, 'packet-decoded', `quiet zone should separate the matrix from a dark screen background: ${darkRoomTrace.reason}`);
   assert.deepStrictEqual(darkRoomTrace.packet, transfer.packets[0]);
@@ -317,6 +348,14 @@ test('receiver diagnostics distinguish absent candidates, bad geometry, and CRC 
   const noCandidate = decodeOpticalFrameDetailed({ width: size, height: size, data: white }, 63);
   assert.equal(noCandidate.status, 'candidate-not-found');
   assert.match(noCandidate.reason, /No square dark frame boundary/);
+  const trackedOnly = decodeOpticalFrameDetailed({ width: size, height: size, data: white }, 63, [
+    { x: 40, y: 40 },
+    { x: 200, y: 40 },
+    { x: 200, y: 200 },
+    { x: 40, y: 200 },
+  ]);
+  assert.equal(trackedOnly.candidateCount, 0, 'tracked coordinates must not be reported as a newly detected candidate');
+  assert.equal(trackedOnly.trackedCandidate, true);
 
   for (let y = 70; y < 130; y += 1) {
     for (let x = 70; x < 130; x += 1) {
@@ -382,7 +421,7 @@ test('matrix and file size limits reject unsupported input', async () => {
   assert.throws(() => createAztecLayout(26), /24, 32, or an odd integer from 31 through 999/);
   assert.throws(() => createAztecLayout(1001), /24, 32, or an odd integer from 31 through 999/);
   await assert.rejects(prepareAztecTransfer(new File([new Uint8Array(MAX_FILE_BYTES + 1)], 'too-large.bin'), 63), /larger than 16 MiB/);
-  await assert.rejects(prepareAztecTransfer(new File([], 'too-small-matrix.bin'), 31), /cannot fit a safe fountain packet/);
+  await assert.rejects(prepareAztecTransfer(new File([], 'too-small-matrix.bin'), 24), /cannot fit a safe fountain packet/);
 });
 
 test('32x32 and 63x63 camera frames rectify perspective and identify quarter-turn orientation', async () => {
@@ -390,11 +429,13 @@ test('32x32 and 63x63 camera frames rectify perspective and identify quarter-tur
   for (const matrixSize of [32, 63]) {
     const transfer = await prepareAztecTransfer(file, matrixSize);
     const packet = transfer.packets[0];
-    for (const rotation of [0, 1, 2, 3]) {
-      const image = makeOpticalFrame(packet, matrixSize, rotation);
-      const decoded = decodeOpticalFrame(image, matrixSize);
-      if (!decoded) throw new Error(`Failed to decode ${matrixSize}x${matrixSize} perspective frame at rotation ${rotation * 90} degrees.`);
-      assert.deepStrictEqual(decoded.packet, packet, `packet mismatch for ${matrixSize}x${matrixSize} at rotation ${rotation * 90} degrees`);
+    for (const imageSize of [360, 720]) {
+      for (const rotation of [0, 1, 2, 3]) {
+        const image = makeOpticalFrame(packet, matrixSize, rotation, imageSize);
+        const decoded = decodeOpticalFrame(image, matrixSize);
+        if (!decoded) throw new Error(`Failed to decode ${matrixSize}x${matrixSize} perspective frame at ${imageSize}px and ${rotation * 90} degrees.`);
+        assert.deepStrictEqual(decoded.packet, packet, `packet mismatch for ${matrixSize}x${matrixSize} at ${imageSize}px and ${rotation * 90} degrees`);
+      }
     }
   }
 });

@@ -36,7 +36,10 @@ const diagnosticElements = {
   frames: document.getElementById('diagFrames') as HTMLElement,
   processing: document.getElementById('diagProcessing') as HTMLElement,
   candidates: document.getElementById('diagCandidates') as HTMLElement,
+  tracking: document.getElementById('diagTracking') as HTMLElement,
   geometry: document.getElementById('diagGeometry') as HTMLElement,
+  confidence: document.getElementById('diagConfidence') as HTMLElement,
+  finder: document.getElementById('diagFinder') as HTMLElement,
   orientation: document.getElementById('diagOrientation') as HTMLElement,
   grid: document.getElementById('diagGrid') as HTMLElement,
   colour: document.getElementById('diagColour') as HTMLElement,
@@ -149,9 +152,16 @@ function updateDiagnostics(trace: Omit<DecoderTrace, 'packet'>, counts: WorkerDi
   diagnosticElements.frames.textContent = `${cameraFramesReceived} received`;
   diagnosticElements.processing.textContent = `${counts.frames} processed (${trace.imageWidth}×${trace.imageHeight})`;
   diagnosticElements.candidates.textContent = `${counts.candidatesDetected} total; ${trace.candidateCount} this frame`;
+  diagnosticElements.tracking.textContent = counts.trackingState;
   diagnosticElements.geometry.textContent = trace.geometryCandidates
     ? `ACCEPTED (${trace.geometryCandidates} this frame; ${counts.validGeometry} total)`
     : trace.candidateCount ? `FAILED — ${trace.reason}` : 'WAITING';
+  diagnosticElements.confidence.textContent = trace.candidateConfidence === null
+    ? 'Not measured'
+    : `${trace.candidateConfidence.toFixed(1)}% structural match`;
+  diagnosticElements.finder.textContent = trace.finderCenter
+    ? `center (${trace.finderCenter.x.toFixed(1)}, ${trace.finderCenter.y.toFixed(1)}); ${trace.finderSizeModules} modules`
+    : 'Not located';
   diagnosticElements.orientation.textContent = trace.orientationFound
     ? `FOUND (${counts.orientationsFound} frames)`
     : trace.candidateCount ? 'NOT FOUND' : 'WAITING';
@@ -245,6 +255,25 @@ function drawDiagnosticOverlay(trace: Omit<DecoderTrace, 'packet'>): void {
     context.strokeStyle = `${colour}88`;
     context.lineWidth = 0.7;
     context.stroke();
+  }
+  if (trace.finderCorners) {
+    context.beginPath();
+    trace.finderCorners.forEach((corner, index) => {
+      const point = mapPoint(corner);
+      if (index === 0) context.moveTo(point.x, point.y);
+      else context.lineTo(point.x, point.y);
+    });
+    context.closePath();
+    context.strokeStyle = '#00e5ff';
+    context.lineWidth = 2;
+    context.stroke();
+    if (trace.finderCenter) {
+      const center = mapPoint(trace.finderCenter);
+      context.beginPath();
+      context.arc(center.x, center.y, 3, 0, Math.PI * 2);
+      context.fillStyle = '#00e5ff';
+      context.fill();
+    }
   }
   for (const corner of trace.corners) {
     const point = mapPoint(corner);
@@ -347,7 +376,10 @@ function resetReceiveState(): void {
   diagnosticElements.frames.textContent = '0 received';
   diagnosticElements.processing.textContent = '0 processed';
   diagnosticElements.candidates.textContent = '0 candidates';
+  diagnosticElements.tracking.textContent = 'SEARCHING';
   diagnosticElements.geometry.textContent = 'WAITING';
+  diagnosticElements.confidence.textContent = 'Not measured';
+  diagnosticElements.finder.textContent = 'Not located';
   diagnosticElements.orientation.textContent = 'WAITING';
   diagnosticElements.grid.textContent = 'WAITING';
   diagnosticElements.colour.textContent = 'WAITING';

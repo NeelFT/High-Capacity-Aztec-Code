@@ -24,7 +24,12 @@ export interface DecoderTrace {
   gridSampled: boolean;
   recognizedModules: number;
   totalModules: number;
+  candidateConfidence: number | null;
   colourConfidence: number | null;
+  finderCenter: FramePoint | null;
+  finderCorners: FrameCorners | null;
+  finderSizeModules: number | null;
+  trackedCandidate: boolean;
   headerValid: boolean | null;
   crcValid: boolean | null;
   corners: FrameCorners | null;
@@ -275,6 +280,16 @@ function makeGridLines(transform: Transform, size: number): Array<[FramePoint, F
   return lines;
 }
 
+function candidateOrientations(candidate: FrameCorners): FrameCorners[] {
+  const orientations: FrameCorners[] = [];
+  for (const direction of [1, -1]) {
+    for (let start = 0; start < 4; start += 1) {
+      orientations.push(Array.from({ length: 4 }, (_, offset) => candidate[(start + direction * offset + 8) % 4]) as FrameCorners);
+    }
+  }
+  return orientations;
+}
+
 function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameCorners): DecoderTrace {
   const base: DecoderTrace = {
     status: 'geometry-failed',
@@ -286,7 +301,12 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
     gridSampled: false,
     recognizedModules: 0,
     totalModules: layout.dataCoordinates.length,
+    candidateConfidence: null,
     colourConfidence: null,
+    finderCenter: null,
+    finderCorners: null,
+    finderSizeModules: null,
+    trackedCandidate: false,
     headerValid: null,
     crcValid: null,
     corners,
@@ -306,6 +326,15 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
   }
   base.geometryCandidates = 1;
   base.gridLines = makeGridLines(transform, layout.targetMatrixSize);
+  const finderEnd = layout.finderStart + layout.finderSize;
+  base.finderCenter = transform(layout.finderCenter + 0.5, layout.finderCenter + 0.5);
+  base.finderCorners = [
+    transform(layout.finderStart, layout.finderStart),
+    transform(finderEnd, layout.finderStart),
+    transform(finderEnd, finderEnd),
+    transform(layout.finderStart, finderEnd),
+  ];
+  base.finderSizeModules = layout.finderSize;
   const references = paletteRgb.map((_, index) => averageColor(image, transform, index + 3, 3));
   const referenceLabs = references.map((reference) => rgbToLab(reference));
   const structural = [...layout.alignmentCoordinates];
@@ -320,6 +349,7 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
     if (classified.index === expectedIndex && classified.nearest < 55 && classified.margin > 2) matched += 1;
   }
   const structuralRatio = structural.length === 0 ? 0 : matched / structural.length;
+  base.candidateConfidence = structuralRatio * 100;
   if (structuralRatio < 0.68) {
     base.status = 'orientation-failed';
     base.reason = `Finder/alignment markers matched ${matched} of ${structural.length} (${(structuralRatio * 100).toFixed(1)}%); 68% is required.`;
@@ -368,10 +398,17 @@ export interface OpticalFrameResult {
 
 export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: number, trackedCorners?: FrameCorners | null): DecoderTrace {
   const layout = createAztecLayout(targetMatrixSize);
-  const candidates = findFrameCandidates(image);
-  if (trackedCorners && !candidates.some((candidate) => candidate.every((point, index) =>
+  if (trackedCorners) {
+    const trackedTrace = decodeCandidate(image, layout, trackedCorners);
+    trackedTrace.trackedCandidate = true;
+    trackedTrace.candidateCount = 0;
+    if (trackedTrace.geometryCandidates && trackedTrace.orientationFound) return trackedTrace;
+  }
+  const detectedCandidates = findFrameCandidates(image);
+  const candidates = detectedCandidates.map((corners) => ({ corners, tracked: false }));
+  if (trackedCorners && !detectedCandidates.some((candidate) => candidate.every((point, index) =>
     Math.hypot(point.x - trackedCorners[index].x, point.y - trackedCorners[index].y) < 3))) {
-    candidates.push(trackedCorners);
+    candidates.push({ corners: trackedCorners, tracked: true });
   }
   if (candidates.length === 0) {
     return {
@@ -384,7 +421,12 @@ export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: 
       gridSampled: false,
       recognizedModules: 0,
       totalModules: layout.dataCoordinates.length,
+      candidateConfidence: null,
       colourConfidence: null,
+      finderCenter: null,
+      finderCorners: null,
+      finderSizeModules: null,
+      trackedCandidate: false,
       headerValid: null,
       crcValid: null,
       corners: null,
@@ -393,18 +435,13 @@ export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: 
       reason: 'No square dark frame boundary was found in the camera image.',
     };
   }
-  const candidateCount = candidates.length;
+  const candidateCount = detectedCandidates.length;
   let best: DecoderTrace | null = null;
   for (const candidate of candidates) {
-    const orientations: FrameCorners[] = [];
-    for (const direction of [1, -1]) {
-      for (let start = 0; start < 4; start += 1) {
-        orientations.push(Array.from({ length: 4 }, (_, offset) => candidate[(start + direction * offset + 8) % 4]) as FrameCorners);
-      }
-    }
-    for (const corners of orientations) {
+    for (const corners of candidateOrientations(candidate.corners)) {
       const trace = decodeCandidate(image, layout, corners);
       trace.candidateCount = candidateCount;
+      trace.trackedCandidate = candidate.tracked;
       if (!best || trace.geometryCandidates > best.geometryCandidates ||
         (trace.orientationFound && !best.orientationFound) ||
         (trace.gridSampled && !best.gridSampled) ||
@@ -425,7 +462,12 @@ export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: 
     gridSampled: false,
     recognizedModules: 0,
     totalModules: layout.dataCoordinates.length,
+    candidateConfidence: null,
     colourConfidence: null,
+    finderCenter: null,
+    finderCorners: null,
+    finderSizeModules: null,
+    trackedCandidate: false,
     headerValid: null,
     crcValid: null,
     corners: null,
