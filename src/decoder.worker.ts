@@ -1,4 +1,5 @@
 import { crc32, FountainEquationSolver, MAX_BLOCK_COUNT, MAX_EQUATION_DEGREE, MAX_FILE_BYTES, readU16, readU32, sha256Hex } from './aztec';
+import { decompressGzip } from './compression';
 import { decodeOpticalFrameDetailed } from './image-decoder';
 import type { DecoderTrace, FrameCorners, PixelImage } from './image-decoder';
 import { deleteReceivedPackets, loadReceivedPackets, saveReceivedPacket } from './packet-store';
@@ -11,7 +12,7 @@ let completionSent = false;
 let blockCount = 0;
 let blockSize = 0;
 let totalBytes = 0;
-let metadata: { name: string; type: string; hash: string } | null = null;
+let metadata: { name: string; type: string; hash: string; compression: 'gzip' | null; originalSize: number | null } | null = null;
 let targetMatrixSize = 63;
 let lastCorners: FrameCorners | null = null;
 let lastLocatorDetected = false;
@@ -204,24 +205,70 @@ function parsePacket(packet: Uint8Array): { frameId: number; session: number; to
   };
 }
 
-function parseMetadata(value: Uint8Array): { name: string; type: string; hash: string } | null {
-  if (value.length < 4 || value[0] !== 1) return null;
-  const nameLength = value[1];
-  const typeLengthOffset = 2 + nameLength;
-  if (nameLength > 120 || typeLengthOffset >= value.length) return null;
+function parseMetadata(value: Uint8Array): { name: string; type: string; hash: string; compression: 'gzip' | null; originalSize: number | null } | null {
+  if (value.length < 4) return null;
+  let compression: 'gzip' | null;
+  let originalSize: number | null;
+  let nameLengthOffset: number;
+  let nameOffset: number;
+  let typeLengthOffset: number;
+  let hashStart: number;
+  let hash: string;
+  if (value[0] === 3) {
+    const flags = value[1];
+    if (flags & ~1) return null;
+    compression = flags & 1 ? 'gzip' : null;
+    if (compression && value.length < 6) return null;
+    originalSize = compression
+      ? new DataView(value.buffer, value.byteOffset, value.byteLength).getUint32(2, true)
+      : null;
+    nameLengthOffset = compression ? 6 : 2;
+    if (nameLengthOffset >= value.length) return null;
+    const nameLength = value[nameLengthOffset];
+    nameOffset = nameLengthOffset + 1;
+    typeLengthOffset = nameOffset + nameLength;
+    if (nameLength > 120 || typeLengthOffset >= value.length) return null;
+    const typeLength = value[typeLengthOffset];
+    hashStart = typeLengthOffset + 1 + typeLength;
+    if (typeLength > 120 || hashStart + 32 !== value.length) return null;
+    hash = Array.from(value.subarray(hashStart), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  } else if (value[0] === 1 || value[0] === 2) {
+    const compressed = value[0] === 2;
+    if (compressed && (value.length < 10 || value[1] !== 1)) return null;
+    compression = compressed ? 'gzip' : null;
+    originalSize = compressed
+      ? new DataView(value.buffer, value.byteOffset, value.byteLength).getUint32(2, true)
+      : null;
+    nameLengthOffset = compressed ? 6 : 1;
+    if (nameLengthOffset >= value.length) return null;
+    const nameLength = value[nameLengthOffset];
+    nameOffset = nameLengthOffset + 1;
+    typeLengthOffset = nameOffset + nameLength;
+    if (nameLength > 120 || typeLengthOffset >= value.length) return null;
+    const typeLength = value[typeLengthOffset];
+    const hashLengthOffset = typeLengthOffset + 1 + typeLength;
+    if (typeLength > 120 || hashLengthOffset + 1 >= value.length) return null;
+    const hashLength = value[hashLengthOffset];
+    hashStart = hashLengthOffset + 1;
+    if (hashLength !== 64 || hashStart + hashLength !== value.length) return null;
+    try {
+      hash = new TextDecoder('utf-8', { fatal: true }).decode(value.subarray(hashStart));
+    } catch {
+      return null;
+    }
+  } else {
+    return null;
+  }
+  const nameLength = value[nameLengthOffset];
+  if (nameLength > 120) return null;
   const typeLength = value[typeLengthOffset];
-  const hashLengthOffset = typeLengthOffset + 1 + typeLength;
-  if (typeLength > 120 || hashLengthOffset + 1 >= value.length) return null;
-  const hashLength = value[hashLengthOffset];
-  const hashStart = hashLengthOffset + 1;
-  if (hashLength !== 64 || hashStart + hashLength !== value.length) return null;
+  if (typeLength > 120) return null;
   try {
     const decoder = new TextDecoder('utf-8', { fatal: true });
-    const name = decoder.decode(value.subarray(2, typeLengthOffset));
-    const type = decoder.decode(value.subarray(typeLengthOffset + 1, hashLengthOffset));
-    const hash = decoder.decode(value.subarray(hashStart));
+    const name = decoder.decode(value.subarray(nameOffset, typeLengthOffset));
+    const type = decoder.decode(value.subarray(typeLengthOffset + 1, hashStart - (value[0] === 3 ? 0 : 1)));
     if (!/^[\da-f]{64}$/i.test(hash)) return null;
-    return { name, type, hash };
+    return { name, type, hash, compression, originalSize };
   } catch {
     return null;
   }
@@ -249,10 +296,12 @@ function acceptPacket(parsed: NonNullable<ReturnType<typeof parsePacket>>, trace
     blockSize = parsed.size;
     totalBytes = parsed.total;
   }
-  if (parsed.metadata[0] === 1) {
+  if (parsed.metadata[0] === 1 || parsed.metadata[0] === 2 || parsed.metadata[0] === 3) {
     const parsedMetadata = parseMetadata(parsed.metadata);
-    if (!parsedMetadata) {
-      rejectPacket(trace, 'Transfer metadata is malformed or contains an invalid UTF-8 name, MIME type, or SHA-256 digest.', true);
+    if (!parsedMetadata ||
+      (parsedMetadata.compression === 'gzip' &&
+        (parsedMetadata.originalSize === null || parsedMetadata.originalSize <= parsed.total || parsedMetadata.originalSize > MAX_FILE_BYTES))) {
+      rejectPacket(trace, 'Transfer metadata is malformed, unsupported, or contains an invalid name, MIME type, size, or SHA-256 digest.', true);
       return false;
     }
     metadata = parsedMetadata;
@@ -306,12 +355,36 @@ async function completeIfSolved(): Promise<void> {
   for (let index = 0; index < blockCount; index += 1) {
     if (!solved.has(index)) return;
   }
-  const bytes = new Uint8Array(totalBytes);
+  const encodedBytes = new Uint8Array(totalBytes);
   for (let index = 0; index < blockCount; index += 1) {
     const block = solved.get(index);
     if (!block) return;
     const start = index * blockSize;
-    bytes.set(block.subarray(0, Math.min(blockSize, bytes.length - start)), start);
+    encodedBytes.set(block.subarray(0, Math.min(blockSize, encodedBytes.length - start)), start);
+  }
+  let bytes = encodedBytes;
+  if (metadata.compression === 'gzip') {
+    try {
+      if (metadata.originalSize === null) throw new Error('Compressed transfer is missing its original size.');
+      const decompressed = await decompressGzip(encodedBytes, metadata.originalSize);
+      bytes = new Uint8Array(decompressed.byteLength);
+      bytes.set(decompressed);
+    } catch (error) {
+      completionSent = true;
+      diagnosticCounts.verification = 'FAILED';
+      diagnosticCounts.latestError = error instanceof Error ? `Compressed transfer could not be decompressed: ${error.message}` : 'Compressed transfer could not be decompressed.';
+      if (latestTrace) reportDiagnostic(latestTrace);
+      postWorkerMessage({ type: 'error', message: diagnosticCounts.latestError });
+      return;
+    }
+    if (metadata.originalSize === null || bytes.length !== metadata.originalSize || bytes.length > MAX_FILE_BYTES) {
+      completionSent = true;
+      diagnosticCounts.verification = 'FAILED';
+      diagnosticCounts.latestError = 'Compressed transfer size does not match its validated metadata.';
+      if (latestTrace) reportDiagnostic(latestTrace);
+      postWorkerMessage({ type: 'error', message: diagnosticCounts.latestError });
+      return;
+    }
   }
   const actualHash = await sha256Hex(bytes);
   if (actualHash !== metadata.hash) {

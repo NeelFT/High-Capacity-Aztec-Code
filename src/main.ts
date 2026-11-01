@@ -463,7 +463,10 @@ async function prepareSelectedFile(file: File, matrixSize: number): Promise<void
     if (generation !== prepareGeneration) return;
     transfer = prepared;
     const layout = createAztecLayout(prepared.targetMatrixSize);
-    frameCount.textContent = `${prepared.frameCount} frames; ${prepared.blockCount} source blocks; ${layout.dataCoordinates.length} data modules; ${layout.alignmentCoordinates.size} structural markers`;
+    const compressionSummary = prepared.compressed
+      ? `; gzip ${prepared.totalBytes.toLocaleString()} → ${prepared.encodedBytes.toLocaleString()} bytes (${Math.round((1 - prepared.encodedBytes / prepared.totalBytes) * 100)}% smaller)`
+      : '';
+    frameCount.textContent = `${prepared.frameCount} frames; ${prepared.blockCount} source blocks; ${layout.dataCoordinates.length} data modules; ${layout.alignmentCoordinates.size} structural markers${compressionSummary}`;
     sendStatus.textContent = 'Ready - press Send to stream continuously';
     sendButton.disabled = false;
   } catch (error) {

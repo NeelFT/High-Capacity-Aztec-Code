@@ -3,12 +3,25 @@ import test from 'node:test';
 
 import { COLORS, colorSymbolMask, createAztecLayout, crc32, decode3BitPacket, decode3BitPayload, drawAztecFrame, encode3BitPayload, EVEN_FINDER_SIZE, FINDER_RING_THICKNESS, FINDER_SIZE, FountainEquationSolver, LOCATOR_COLOR, MAX_FILE_BYTES, MODULE_PIXELS, prepareAztecTransfer, QUIET_ZONE_MODULES, renderAztecFrameMatrix, sha256Hex, solveFountainEquations } from './aztec.ts';
 import { decodeOpticalFrame, decodeOpticalFrameDetailed } from './image-decoder.ts';
+import { decompressGzip } from './compression.ts';
 import type { PixelImage } from './image-decoder.ts';
 
 function makePayload(length: number, seed: number): Uint8Array<ArrayBuffer> {
   const bytes = new Uint8Array(length);
   for (let index = 0; index < length; index += 1) {
     bytes[index] = (index * 37 + seed) & 0xff;
+  }
+  return bytes;
+}
+
+function makePseudoRandomPayload(length: number, seed: number): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(length);
+  let state = seed >>> 0;
+  for (let index = 0; index < length; index += 1) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    bytes[index] = state & 0xff;
   }
   return bytes;
 }
@@ -742,8 +755,8 @@ test('empty files and UTF-8 filenames retain valid packet metadata', async () =>
   const metadataOffset = 21 + degree * 2;
   const metadataLength = packet[metadataOffset];
   const metadata = packet.subarray(metadataOffset + 1, metadataOffset + 1 + metadataLength);
-  const nameLength = metadata[1];
-  assert.equal(new TextDecoder().decode(metadata.subarray(2, 2 + nameLength)), file.name);
+  const nameLength = metadata[2];
+  assert.equal(new TextDecoder().decode(metadata.subarray(3, 3 + nameLength)), file.name);
 
   const solver = new FountainEquationSolver(transfer.blockCount, transfer.blockSize);
   const payloadOffset = metadataOffset + 1 + metadataLength;
@@ -770,7 +783,7 @@ test('incremental fountain solver handles out-of-order and repeated equations', 
 });
 
 test('32x32 transfer packets combine in reverse order when metadata arrives last', async () => {
-  const source = makePayload(512, 83);
+  const source = makePseudoRandomPayload(512, 83);
   const transfer = await prepareAztecTransfer(new File([source], 'reverse-order.bin', { type: 'application/octet-stream' }), 32);
   assert.ok(transfer.blockCount > 1);
   const solver = new FountainEquationSolver(transfer.blockCount, transfer.blockSize);
@@ -793,13 +806,83 @@ test('32x32 transfer packets combine in reverse order when metadata arrives last
   }
   assert.equal(metadataPacketSeen, true);
   assert.equal(solver.solved.size, transfer.blockCount);
-  const reconstructed = new Uint8Array(transfer.totalBytes);
+  const reconstructed = new Uint8Array(transfer.encodedBytes);
   for (let index = 0; index < transfer.blockCount; index += 1) {
     const block = solver.solved.get(index);
     assert.ok(block, `missing source block ${index}`);
     reconstructed.set(block.subarray(0, Math.min(block.length, reconstructed.length - index * transfer.blockSize)), index * transfer.blockSize);
   }
-  assert.deepStrictEqual(reconstructed, source);
+  assert.deepStrictEqual(
+    transfer.compressed ? await decompressGzip(reconstructed, source.length) : reconstructed,
+    source,
+  );
+});
+
+test('gzip compression reduces frame count and receiver restores the original file bytes', async () => {
+  const source = new TextEncoder().encode('The same repeated text is highly compressible. '.repeat(4000));
+  const transfer = await prepareAztecTransfer(new File([source], 'compressed.txt', { type: 'text/plain' }), 32);
+  assert.equal(transfer.compressed, true);
+  assert.ok(transfer.encodedBytes < source.length / 10, 'repetitive input should compress substantially');
+  assert.ok(transfer.blockCount < Math.ceil(source.length / transfer.blockSize) / 5, 'compression should substantially reduce source blocks');
+  const uncompressedBlocks = Math.ceil(source.length / transfer.blockSize);
+  const uncompressedFrames = uncompressedBlocks + Math.ceil(uncompressedBlocks * 1.5);
+  assert.ok(transfer.frameCount < uncompressedFrames, 'compression should reduce the number of frames sent');
+
+  const packet = transfer.packets[0];
+  const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+  assert.equal(view.getUint32(4, true), transfer.encodedBytes, 'packet header must advertise compressed length');
+  const metadataOffset = 21 + packet[20] * 2;
+  const metadataLength = packet[metadataOffset];
+  const metadata = packet.subarray(metadataOffset + 1, metadataOffset + 1 + metadataLength);
+  assert.equal(metadata[0], 3, 'compressed transfer metadata must use the compact format');
+  assert.equal(metadata[1], 1, 'metadata must identify gzip compression');
+  assert.equal(new DataView(metadata.buffer, metadata.byteOffset, metadata.byteLength).getUint32(2, true), source.length);
+  assert.equal(metadata.length, 2 + 4 + 1 + new TextEncoder().encode('compressed.txt').length +
+    1 + new TextEncoder().encode('text/plain').length + 32, 'metadata should store the SHA-256 digest in binary');
+
+  const solver = new FountainEquationSolver(transfer.blockCount, transfer.blockSize);
+  for (const sourcePacket of transfer.packets.slice(0, transfer.blockCount)) {
+    const sourceView = new DataView(sourcePacket.buffer, sourcePacket.byteOffset, sourcePacket.byteLength);
+    const degree = sourcePacket[20];
+    let offset = 21 + degree * 2;
+    const metadataBytes = sourcePacket[offset++];
+    offset += metadataBytes;
+    assert.equal(solver.addEquation([sourceView.getUint16(21, true)], sourcePacket.subarray(offset, offset + transfer.blockSize)), true);
+  }
+  const encoded = new Uint8Array(transfer.encodedBytes);
+  for (let index = 0; index < transfer.blockCount; index += 1) {
+    const block = solver.solved.get(index);
+    assert.ok(block, `missing compressed source block ${index}`);
+    encoded.set(block.subarray(0, Math.min(block.length, encoded.length - index * transfer.blockSize)), index * transfer.blockSize);
+  }
+  const restored = await decompressGzip(encoded, source.length);
+  assert.deepStrictEqual(restored, source);
+  assert.equal(await sha256Hex(restored), await sha256Hex(source));
+  await assert.rejects(decompressGzip(encoded, source.length - 1), /exceeds its .* size limit/);
+
+  const noise = makePseudoRandomPayload(512, 0x71a4c3);
+  const uncompressed = await prepareAztecTransfer(new File([noise], 'noise.bin'), 32);
+  assert.equal(uncompressed.compressed, false, 'incompressible files should not gain a gzip header');
+  assert.equal(uncompressed.encodedBytes, noise.length);
+  const plainPacket = uncompressed.packets[0];
+  const plainOffset = 21 + plainPacket[20] * 2;
+  const plainMetadataLength = plainPacket[plainOffset];
+  const plainMetadata = plainPacket.subarray(plainOffset + 1, plainOffset + 1 + plainMetadataLength);
+  assert.equal(plainMetadata[0], 3, 'uncompressed transfers should use compact metadata');
+  assert.equal(plainMetadata[1], 0, 'uncompressed compact metadata should not set encoding flags');
+  const plainNameLength = plainMetadata[2];
+  const plainTypeLengthOffset = 3 + plainNameLength;
+  const plainTypeLength = plainMetadata[plainTypeLengthOffset];
+  assert.equal(plainMetadata.length, 2 + 1 + plainNameLength + 1 + plainTypeLength + 32);
+  assert.equal(plainMetadata.length, 1 + 1 + plainNameLength + 1 + plainTypeLength + 1 + 64 - 32,
+    'binary SHA-256 metadata should save 32 bytes versus hexadecimal');
+  const capacity = Math.floor(createAztecLayout(32).dataCoordinates.length * 3 / 8);
+  const legacyMetadataLength = 1 + 1 + plainNameLength + 1 + plainTypeLength + 1 + 64;
+  const legacyBlockSize = Math.min(capacity - 26 - 24 * 2 - 1, capacity - 26 - 2 - legacyMetadataLength);
+  const legacyBlockCount = Math.ceil(noise.length / legacyBlockSize);
+  assert.ok(uncompressed.blockSize > legacyBlockSize, 'compact metadata should free first-packet capacity for file data');
+  assert.ok(uncompressed.frameCount < legacyBlockCount + Math.ceil(legacyBlockCount * 1.5),
+    'compact metadata should reduce the total frames for this 32x32 transfer');
 });
 
 test('matrix and file size limits reject unsupported input', async () => {
@@ -847,11 +930,14 @@ test('valid optical packet reaches reconstruction and verifies the complete file
   let offset = 21 + degree * 2;
   const metadataLength = packet[offset++];
   const metadata = packet.subarray(offset, offset + metadataLength);
-  const nameLength = metadata[1];
-  const typeLengthOffset = 2 + nameLength;
+  assert.equal(metadata[0], 3);
+  const compressed = metadata[1] === 1;
+  const nameLengthOffset = compressed ? 6 : 2;
+  const nameLength = metadata[nameLengthOffset];
+  const typeLengthOffset = nameLengthOffset + 1 + nameLength;
   const typeLength = metadata[typeLengthOffset];
-  const hashLengthOffset = typeLengthOffset + 1 + typeLength;
-  const expectedHash = new TextDecoder().decode(metadata.subarray(hashLengthOffset + 1));
+  const hashStart = typeLengthOffset + 1 + typeLength;
+  const expectedHash = Array.from(metadata.subarray(hashStart), (byte) => byte.toString(16).padStart(2, '0')).join('');
   offset += metadataLength;
   const payload = packet.subarray(offset, offset + transfer.blockSize);
   const solver = new FountainEquationSolver(transfer.blockCount, transfer.blockSize);
@@ -862,8 +948,7 @@ test('valid optical packet reaches reconstruction and verifies the complete file
 });
 
 test('fountain packets recover files through realistic packet-loss patterns', async () => {
-  const payload = new Uint8Array(1_000_000);
-  for (let index = 0; index < payload.length; index += 1) payload[index] = (index * 17 + 13) & 0xff;
+  const payload = makePseudoRandomPayload(1_000_000, 0x51f15e);
   const file = new File([payload], 'fountain.bin', { type: 'application/octet-stream' });
   const transfer = await prepareAztecTransfer(file, 95);
   assert.ok(transfer.blockCount > 1, 'expected multi-block file for a meaningful fountain recovery test');
@@ -921,14 +1006,15 @@ test('fountain packets recover files through realistic packet-loss patterns', as
 
     const solved = solver.solved;
     assert.ok(solved.size >= transfer.blockCount, `recovery failed at ${lossRate * 100}% ${pattern} loss`);
-    const recovered = new Uint8Array(transfer.totalBytes);
+    const recovered = new Uint8Array(transfer.encodedBytes);
     for (let blockIndex = 0; blockIndex < transfer.blockCount; blockIndex += 1) {
       const block = solved.get(blockIndex);
       if (!block) throw new Error(`Missing block ${blockIndex} after ${lossRate * 100}% ${pattern} loss.`);
       const start = blockIndex * transfer.blockSize;
       recovered.set(block.subarray(0, Math.min(block.length, recovered.length - start)), start);
     }
-    assert.deepStrictEqual(recovered, payload, `recovered payload mismatch at ${lossRate * 100}% ${pattern} loss`);
+    const restored = transfer.compressed ? await decompressGzip(recovered, payload.length) : recovered;
+    assert.deepStrictEqual(restored, payload, `recovered payload mismatch at ${lossRate * 100}% ${pattern} loss`);
     if (lossRate === 0 && pattern === 'random') {
       const batchSolved = new Map<number, Uint8Array>();
       solveFountainEquations(equations, batchSolved);

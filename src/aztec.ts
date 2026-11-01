@@ -1,3 +1,5 @@
+import { compressGzipIfSmaller } from './compression.ts';
+
 export const FINDER_SIZE = 9;
 export const EVEN_FINDER_SIZE = FINDER_SIZE - 1;
 export const FINDER_RING_THICKNESS = 1;
@@ -13,7 +15,6 @@ const PALETTE_Y = 3;
 const MAX_BLOCK_SIZE = 30 * 1024;
 export const MAX_EQUATION_DEGREE = 24;
 const PACKET_FIXED_BYTES = HEADER_BYTES + 4 + 2 + 2 + 1 + 1;
-const MAX_METADATA_BYTES = 3 + 120 + 120 + 64;
 
 export interface AztecLayout {
   targetMatrixSize: number;
@@ -43,6 +44,8 @@ export interface PreparedAztecTransfer {
   file: File;
   session: number;
   totalBytes: number;
+  encodedBytes: number;
+  compressed: boolean;
   blockCount: number;
   blockSize: number;
   packets: Uint8Array[];
@@ -592,22 +595,40 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
       const session = randomU32();
       const fileBytes = new Uint8Array(await file.arrayBuffer());
       const fileHashHex = await sha256Hex(fileBytes);
+      const compressedBytes = await compressGzipIfSmaller(fileBytes);
+      const encodedBytes = compressedBytes ?? fileBytes;
       const metadataName = encodeUtf8(file.name);
       const metadataType = encodeUtf8(file.type || 'application/octet-stream');
-      const hashBytes = encodeUtf8(fileHashHex.slice(0, 64));
+      const hashBytes = Uint8Array.from({ length: 32 }, (_, index) => Number.parseInt(fileHashHex.slice(index * 2, index * 2 + 2), 16));
       if (metadataName.length > 120) throw new Error('File name exceeds the 120-byte transfer limit.');
       if (metadataType.length > 120) throw new Error('File type exceeds the 120-byte transfer limit.');
-      if (hashBytes.length > 64) throw new Error('File hash is too large for a fountain packet.');
-      const metadata = new Uint8Array([1, metadataName.length, ...metadataName, metadataType.length, ...metadataType, hashBytes.length, ...hashBytes]);
+      const originalSizeBytes = compressedBytes
+        ? new Uint8Array([
+          fileBytes.length & 0xff,
+          fileBytes.length >>> 8 & 0xff,
+          fileBytes.length >>> 16 & 0xff,
+          fileBytes.length >>> 24 & 0xff,
+        ])
+        : new Uint8Array();
+      const metadata = new Uint8Array([
+        3,
+        compressedBytes ? 1 : 0,
+        ...originalSizeBytes,
+        metadataName.length,
+        ...metadataName,
+        metadataType.length,
+        ...metadataType,
+        ...hashBytes,
+      ]);
       const blockSize = framePayloadSize(layout, metadata.length);
-      const blockCount = Math.max(1, Math.ceil(file.size / blockSize));
+      const blockCount = Math.max(1, Math.ceil(encodedBytes.length / blockSize));
       if (blockCount > MAX_BLOCK_COUNT) {
         throw new Error(`This matrix size requires ${blockCount} blocks, above the protocol limit of ${MAX_BLOCK_COUNT}. Choose a larger matrix or smaller file.`);
       }
       const blocks: Uint8Array[] = [];
       for (let index = 0; index < blockCount; index += 1) {
         const block = new Uint8Array(blockSize);
-        block.set(new Uint8Array(fileBytes.subarray(index * blockSize, (index + 1) * blockSize)));
+        block.set(encodedBytes.subarray(index * blockSize, (index + 1) * blockSize));
         blocks.push(block);
         onProgress?.(index + 1, blockCount);
       }
@@ -625,7 +646,7 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
         let packet = new Uint8Array(packetLength);
         const view = new DataView(packet.buffer);
         writeU32(view, 0, frameId);
-        writeU32(view, 4, file.size);
+        writeU32(view, 4, encodedBytes.length);
         writeU32(view, 8, seed);
         writeU32(view, HEADER_BYTES, session);
         writeU16(view, HEADER_BYTES + 4, blockCount);
@@ -664,7 +685,18 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
         }
         packets.push(packet);
       }
-      resolve({ file, session, totalBytes: file.size, blockCount, blockSize, packets, frameCount: packets.length, targetMatrixSize: layout.targetMatrixSize });
+      resolve({
+        file,
+        session,
+        totalBytes: file.size,
+        encodedBytes: encodedBytes.length,
+        compressed: compressedBytes !== null,
+        blockCount,
+        blockSize,
+        packets,
+        frameCount: packets.length,
+        targetMatrixSize: layout.targetMatrixSize,
+      });
     } catch (error) {
       reject(error);
     }
