@@ -443,8 +443,10 @@ export function solveFountainEquations(equations: Map<number, { indices: number[
 }
 
 function validateMatrixSize(targetMatrixSize: number): number {
-  if (!Number.isInteger(targetMatrixSize) || targetMatrixSize < FINDER_SIZE + 16 || targetMatrixSize > 999 || targetMatrixSize % 2 === 0) {
-    throw new Error('The matrix size must be an odd integer from 31 through 999.');
+  if (!Number.isInteger(targetMatrixSize) ||
+    (targetMatrixSize !== 24 && targetMatrixSize !== 32 &&
+      (targetMatrixSize < FINDER_SIZE + 16 || targetMatrixSize > 999 || targetMatrixSize % 2 === 0))) {
+    throw new Error('The matrix size must be 24, 32, or an odd integer from 31 through 999.');
   }
   return targetMatrixSize;
 }
@@ -514,14 +516,17 @@ function packetCapacity(layout: AztecLayout): number {
   return Math.floor((layout.dataCoordinates.length * 3) / 8);
 }
 
-function framePayloadSize(layout: AztecLayout): number {
+function framePayloadSize(layout: AztecLayout, metadataLength: number): number {
+  const capacity = packetCapacity(layout);
   const maxDegree = Math.min(MAX_EQUATION_DEGREE, MAX_BLOCK_COUNT);
-  const reserved = PACKET_FIXED_BYTES + 4 + maxDegree * 2 + MAX_METADATA_BYTES;
-  const available = packetCapacity(layout) - reserved;
-  if (available < 64) {
+  const checksumAndHeader = PACKET_FIXED_BYTES + 4;
+  const maxRepairPayload = capacity - checksumAndHeader - maxDegree * 2 - 1;
+  const metadataPacketPayload = capacity - checksumAndHeader - 2 - metadataLength;
+  const available = Math.min(MAX_BLOCK_SIZE, maxRepairPayload, metadataPacketPayload);
+  if (available < 1) {
     throw new Error(`Matrix ${layout.targetMatrixSize}x${layout.targetMatrixSize} cannot fit a safe fountain packet. Choose a larger matrix.`);
   }
-  return Math.min(MAX_BLOCK_SIZE, available);
+  return available;
 }
 
 export function prepareAztecTransfer(file: File, targetMatrixSize: number, onProgress?: (current: number, total: number) => void): Promise<PreparedAztecTransfer> {
@@ -532,13 +537,20 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
       }
       const layout = createAztecLayout(targetMatrixSize);
       const session = randomU32();
-      const blockSize = framePayloadSize(layout);
+      const fileBytes = new Uint8Array(await file.arrayBuffer());
+      const fileHashHex = await sha256Hex(fileBytes);
+      const metadataName = encodeUtf8(file.name);
+      const metadataType = encodeUtf8(file.type || 'application/octet-stream');
+      const hashBytes = encodeUtf8(fileHashHex.slice(0, 64));
+      if (metadataName.length > 120) throw new Error('File name exceeds the 120-byte transfer limit.');
+      if (metadataType.length > 120) throw new Error('File type exceeds the 120-byte transfer limit.');
+      if (hashBytes.length > 64) throw new Error('File hash is too large for a fountain packet.');
+      const metadata = new Uint8Array([1, metadataName.length, ...metadataName, metadataType.length, ...metadataType, hashBytes.length, ...hashBytes]);
+      const blockSize = framePayloadSize(layout, metadata.length);
       const blockCount = Math.max(1, Math.ceil(file.size / blockSize));
       if (blockCount > MAX_BLOCK_COUNT) {
         throw new Error(`This matrix size requires ${blockCount} blocks, above the protocol limit of ${MAX_BLOCK_COUNT}. Choose a larger matrix or smaller file.`);
       }
-      const fileBytes = new Uint8Array(await file.arrayBuffer());
-      const fileHashHex = await sha256Hex(fileBytes);
       const blocks: Uint8Array[] = [];
       for (let index = 0; index < blockCount; index += 1) {
         const block = new Uint8Array(blockSize);
@@ -546,12 +558,6 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
         blocks.push(block);
         onProgress?.(index + 1, blockCount);
       }
-      const metadataName = encodeUtf8(file.name);
-      const metadataType = encodeUtf8(file.type || 'application/octet-stream');
-      const hashBytes = encodeUtf8(fileHashHex.slice(0, 64));
-      if (metadataName.length > 120) throw new Error('File name exceeds the 120-byte transfer limit.');
-      if (metadataType.length > 120) throw new Error('File type exceeds the 120-byte transfer limit.');
-      if (hashBytes.length > 64) throw new Error('File hash is too large for a fountain packet.');
       const packets: Uint8Array[] = [];
       const totalPackets = blockCount + Math.max(1, Math.ceil(blockCount * REDUNDANCY));
       for (let frameId = 0; frameId < totalPackets; frameId += 1) {
@@ -559,10 +565,10 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
         const indices = frameId < blockCount ? [frameId] : chooseSubset(seed, blockCount);
         const payload = new Uint8Array(blockSize);
         for (const index of indices) xorInto(payload, blocks[index]);
-        const metadata = frameId === 0
-          ? new Uint8Array([1, metadataName.length, ...metadataName, metadataType.length, ...metadataType, hashBytes.length, ...hashBytes])
+        const packetMetadata = frameId === 0
+          ? metadata
           : new Uint8Array([0]);
-        const packetLength = PACKET_FIXED_BYTES + indices.length * 2 + metadata.length + blockSize + 4;
+        const packetLength = PACKET_FIXED_BYTES + indices.length * 2 + packetMetadata.length + blockSize + 4;
         const packet = new Uint8Array(packetLength);
         const view = new DataView(packet.buffer);
         writeU32(view, 0, frameId);
@@ -577,9 +583,9 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
           writeU16(view, offset, index);
           offset += 2;
         }
-        packet[offset++] = metadata.length;
-        packet.set(metadata, offset);
-        offset += metadata.length;
+        packet[offset++] = packetMetadata.length;
+        packet.set(packetMetadata, offset);
+        offset += packetMetadata.length;
         packet.set(payload, offset);
         offset += payload.length;
         writeU32(view, offset, crc32(packet.subarray(0, offset)));

@@ -268,6 +268,19 @@ test('renderer redraws every module and changes frame-dependent padding', async 
   assert.notDeepEqual(firstMatrix, secondMatrix);
 });
 
+test('32x32 frames carry and decode valid packets while 24x24 remains below protocol capacity', async () => {
+  const file = new File([makePayload(12, 41)], 'small.bin', { type: 'application/octet-stream' });
+  const transfer = await prepareAztecTransfer(file, 32);
+  assert.equal(transfer.targetMatrixSize, 32);
+  assert.ok(transfer.blockSize > 0);
+  const trace = decodeOpticalFrameDetailed(makeRenderedImage(transfer.packets[0], 32), 32);
+  assert.equal(trace.status, 'packet-decoded', trace.reason);
+  assert.deepStrictEqual(trace.packet, transfer.packets[0]);
+
+  assert.equal(createAztecLayout(24).dataCoordinates.length * 3 / 8, 30);
+  await assert.rejects(prepareAztecTransfer(file, 24), /cannot fit a safe fountain packet/);
+});
+
 test('actual sender render decodes in the receiver pipeline at varied brightness', async () => {
   const transfer = await prepareAztecTransfer(new File([makePayload(128, 77)], 'self-test.bin'), 63);
   const image = makeRenderedImage(transfer.packets[0], transfer.targetMatrixSize);
@@ -362,8 +375,9 @@ test('incremental fountain solver handles out-of-order and repeated equations', 
 });
 
 test('matrix and file size limits reject unsupported input', async () => {
-  assert.throws(() => createAztecLayout(30), /odd integer from 31 through 999/);
-  assert.throws(() => createAztecLayout(1001), /odd integer from 31 through 999/);
+  assert.throws(() => createAztecLayout(30), /24, 32, or an odd integer from 31 through 999/);
+  assert.throws(() => createAztecLayout(26), /24, 32, or an odd integer from 31 through 999/);
+  assert.throws(() => createAztecLayout(1001), /24, 32, or an odd integer from 31 through 999/);
   await assert.rejects(prepareAztecTransfer(new File([new Uint8Array(MAX_FILE_BYTES + 1)], 'too-large.bin'), 63), /larger than 16 MiB/);
   await assert.rejects(prepareAztecTransfer(new File([], 'too-small-matrix.bin'), 31), /cannot fit a safe fountain packet/);
 });
