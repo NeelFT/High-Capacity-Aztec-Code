@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import basicSsl from '@vitejs/plugin-basic-ssl';
 
 export default defineConfig({
+  base: process.env.GITHUB_ACTIONS === 'true' ? '/high-capacity-aztec-code/' : '/',
   plugins: [basicSsl()],
   server: {
     host: true,
