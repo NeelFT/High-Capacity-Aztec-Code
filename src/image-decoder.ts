@@ -49,13 +49,13 @@ const paletteRgb = COLORS.map((color) => [
   parseInt(color.slice(5, 7), 16),
 ]);
 
-function isDarkPixel(image: PixelImage, x: number, y: number): boolean {
+function isDarkPixel(image: PixelImage, x: number, y: number, threshold: number): boolean {
   const offset = (y * image.width + x) * 4;
   const alpha = image.data[offset + 3] / 255;
   const red = image.data[offset] * alpha + 255 * (1 - alpha);
   const green = image.data[offset + 1] * alpha + 255 * (1 - alpha);
   const blue = image.data[offset + 2] * alpha + 255 * (1 - alpha);
-  return red <= 65 && green <= 65 && blue <= 65;
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue <= threshold;
 }
 
 function isLocatorPixel(image: PixelImage, x: number, y: number): boolean {
@@ -64,7 +64,7 @@ function isLocatorPixel(image: PixelImage, x: number, y: number): boolean {
   const red = image.data[offset] * alpha + 255 * (1 - alpha);
   const green = image.data[offset + 1] * alpha + 255 * (1 - alpha);
   const blue = image.data[offset + 2] * alpha + 255 * (1 - alpha);
-  return red - green > 24 && green - blue > 18 && red > green * 1.2 && green > blue * 1.2;
+  return red > 35 && red - green > 10 && green - blue > 8 && red > green * 1.1 && green > blue * 1.1;
 }
 
 interface FrameCandidate {
@@ -158,12 +158,26 @@ function findFrameCandidates(image: PixelImage): FrameCandidate[] {
   const rows = Math.ceil(image.height / step);
   const darkMask = new Uint8Array(columns * rows);
   const locatorMask = new Uint8Array(columns * rows);
+  let maximumLuminance = 0;
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < columns; x += 1) {
+      const sourceX = Math.min(image.width - 1, x * step);
+      const sourceY = Math.min(image.height - 1, y * step);
+      const offset = (sourceY * image.width + sourceX) * 4;
+      const alpha = image.data[offset + 3] / 255;
+      const red = image.data[offset] * alpha + 255 * (1 - alpha);
+      const green = image.data[offset + 1] * alpha + 255 * (1 - alpha);
+      const blue = image.data[offset + 2] * alpha + 255 * (1 - alpha);
+      maximumLuminance = Math.max(maximumLuminance, 0.2126 * red + 0.7152 * green + 0.0722 * blue);
+    }
+  }
+  const darkThreshold = Math.min(150, Math.max(55, maximumLuminance * 0.58));
   for (let y = 0; y < rows; y += 1) {
     for (let x = 0; x < columns; x += 1) {
       const sourceX = Math.min(image.width - 1, x * step);
       const sourceY = Math.min(image.height - 1, y * step);
       const index = y * columns + x;
-      if (isDarkPixel(image, sourceX, sourceY)) darkMask[index] = 1;
+      if (isDarkPixel(image, sourceX, sourceY, darkThreshold)) darkMask[index] = 1;
       if (isLocatorPixel(image, sourceX, sourceY)) locatorMask[index] = 1;
     }
   }
@@ -260,15 +274,17 @@ function averageColor(image: PixelImage, transform: Transform, cellX: number, ce
   const red: number[] = [];
   const green: number[] = [];
   const blue: number[] = [];
-  for (const offsetY of [0.25, 0.5, 0.75]) {
-    for (const offsetX of [0.25, 0.5, 0.75]) {
+  const offsets = [0.3, 0.4, 0.5, 0.6, 0.7];
+  for (const offsetY of offsets) {
+    for (const offsetX of offsets) {
       const point = transform(cellX + offsetX, cellY + offsetY);
       const x = Math.max(0, Math.min(image.width - 1, Math.round(point.x)));
       const y = Math.max(0, Math.min(image.height - 1, Math.round(point.y)));
       const offset = (y * image.width + x) * 4;
-      red.push(image.data[offset]);
-      green.push(image.data[offset + 1]);
-      blue.push(image.data[offset + 2]);
+      const alpha = image.data[offset + 3] / 255;
+      red.push(image.data[offset] * alpha + 255 * (1 - alpha));
+      green.push(image.data[offset + 1] * alpha + 255 * (1 - alpha));
+      blue.push(image.data[offset + 2] * alpha + 255 * (1 - alpha));
     }
   }
   const median = (channel: number[]): number => {
@@ -296,26 +312,28 @@ function rgbToLab([red, green, blue]: [number, number, number]): LabColor {
   return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
 }
 
-function nearestPaletteColor(color: [number, number, number], referenceLabs: LabColor[]): { index: number; secondIndex: number; nearest: number; margin: number } {
+function nearestPaletteColor(color: [number, number, number], referenceLabs: LabColor[]): {
+  index: number;
+  alternatives: Array<{ index: number; margin: number }>;
+  nearest: number;
+  margin: number;
+} {
   const sampleLab = rgbToLab(color);
-  let bestIndex = -1;
-  let secondIndex = -1;
-  let nearest = Infinity;
-  let secondNearest = Infinity;
+  const ranked: Array<{ index: number; distance: number }> = [];
   for (let index = 0; index < referenceLabs.length; index += 1) {
     const reference = referenceLabs[index];
     const distance = Math.hypot(sampleLab[0] - reference[0], sampleLab[1] - reference[1], sampleLab[2] - reference[2]);
-    if (distance < nearest) {
-      secondNearest = nearest;
-      secondIndex = bestIndex;
-      nearest = distance;
-      bestIndex = index;
-    } else if (distance < secondNearest) {
-      secondNearest = distance;
-      secondIndex = index;
-    }
+    ranked.push({ index, distance });
   }
-  return { index: bestIndex, secondIndex, nearest, margin: secondNearest - nearest };
+  ranked.sort((a, b) => a.distance - b.distance);
+  const nearest = ranked[0];
+  const secondNearest = ranked[1];
+  return {
+    index: nearest.index,
+    alternatives: ranked.slice(1, 4).map(({ index, distance }) => ({ index, margin: distance - nearest.distance })),
+    nearest: nearest.distance,
+    margin: secondNearest.distance - nearest.distance,
+  };
 }
 
 function decodeWithSupportedMasks(symbols: Uint8Array): PacketDecodeResult {
@@ -335,22 +353,31 @@ function decodeWithSupportedMasks(symbols: Uint8Array): PacketDecodeResult {
 function recoverColorErrors(symbols: Uint8Array, alternatives: Array<{ index: number; symbol: number; margin: number }>): PacketDecodeResult {
   const initial = decodeWithSupportedMasks(symbols);
   if (initial.status === 'decoded') return initial;
-  const likely = alternatives.sort((a, b) => a.margin - b.margin).slice(0, 128);
-  for (let first = 0; first < likely.length; first += 1) {
-    const candidate = likely[first];
+  const rankedAlternatives = alternatives.sort((a, b) => a.margin - b.margin);
+  const likely: typeof rankedAlternatives = [];
+  const seenModules = new Set<number>();
+  for (const alternative of rankedAlternatives) {
+    if (seenModules.has(alternative.index)) continue;
+    seenModules.add(alternative.index);
+    likely.push(alternative);
+    if (likely.length === 192) break;
+  }
+  const singleCandidates = rankedAlternatives.slice(0, 256);
+  for (const candidate of singleCandidates) {
     const original = symbols[candidate.index];
     symbols[candidate.index] = candidate.symbol;
     const decoded = decodeWithSupportedMasks(symbols);
     symbols[candidate.index] = original;
     if (decoded.status === 'decoded') return decoded;
   }
-  const pairCandidates = likely.slice(0, 16);
+  const pairCandidates = likely.slice(0, 48);
   for (let first = 0; first < pairCandidates.length; first += 1) {
     const firstCandidate = pairCandidates[first];
     const firstOriginal = symbols[firstCandidate.index];
     symbols[firstCandidate.index] = firstCandidate.symbol;
     for (let second = first + 1; second < pairCandidates.length; second += 1) {
       const secondCandidate = pairCandidates[second];
+      if (secondCandidate.index === firstCandidate.index) continue;
       const secondOriginal = symbols[secondCandidate.index];
       symbols[secondCandidate.index] = secondCandidate.symbol;
       const decoded = decodeWithSupportedMasks(symbols);
@@ -359,6 +386,33 @@ function recoverColorErrors(symbols: Uint8Array, alternatives: Array<{ index: nu
         symbols[firstCandidate.index] = firstOriginal;
         return decoded;
       }
+    }
+    symbols[firstCandidate.index] = firstOriginal;
+  }
+  const tripleCandidates = likely.slice(0, 18);
+  for (let first = 0; first < tripleCandidates.length; first += 1) {
+    const firstCandidate = tripleCandidates[first];
+    const firstOriginal = symbols[firstCandidate.index];
+    symbols[firstCandidate.index] = firstCandidate.symbol;
+    for (let second = first + 1; second < tripleCandidates.length; second += 1) {
+      const secondCandidate = tripleCandidates[second];
+      if (secondCandidate.index === firstCandidate.index) continue;
+      const secondOriginal = symbols[secondCandidate.index];
+      symbols[secondCandidate.index] = secondCandidate.symbol;
+      for (let third = second + 1; third < tripleCandidates.length; third += 1) {
+        const thirdCandidate = tripleCandidates[third];
+        if (thirdCandidate.index === firstCandidate.index || thirdCandidate.index === secondCandidate.index) continue;
+        const thirdOriginal = symbols[thirdCandidate.index];
+        symbols[thirdCandidate.index] = thirdCandidate.symbol;
+        const decoded = decodeWithSupportedMasks(symbols);
+        symbols[thirdCandidate.index] = thirdOriginal;
+        if (decoded.status === 'decoded') {
+          symbols[secondCandidate.index] = secondOriginal;
+          symbols[firstCandidate.index] = firstOriginal;
+          return decoded;
+        }
+      }
+      symbols[secondCandidate.index] = secondOriginal;
     }
     symbols[firstCandidate.index] = firstOriginal;
   }
@@ -463,7 +517,9 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
     const classified = nearestPaletteColor(averageColor(image, transform, x, y), referenceLabs);
     totalMargin += Math.max(0, classified.margin);
     recognizedModules += 1;
-    if (classified.secondIndex >= 0) alternatives.push({ index, symbol: classified.secondIndex, margin: classified.margin });
+    for (const alternative of classified.alternatives) {
+      alternatives.push({ index, symbol: alternative.index, margin: alternative.margin });
+    }
     symbols[index] = classified.index;
   }
   base.gridSampled = true;

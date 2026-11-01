@@ -13,6 +13,34 @@ function makePayload(length: number, seed: number): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
+function addCameraBlurAndColorCast(image: PixelImage): PixelImage {
+  const data = new Uint8ClampedArray(image.data.length);
+  for (let y = 0; y < image.height; y += 1) {
+    for (let x = 0; x < image.width; x += 1) {
+      const channels = [0, 0, 0];
+      let samples = 0;
+      for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+          const sampleX = Math.max(0, Math.min(image.width - 1, x + offsetX));
+          const sampleY = Math.max(0, Math.min(image.height - 1, y + offsetY));
+          const sampleOffset = (sampleY * image.width + sampleX) * 4;
+          for (let channel = 0; channel < 3; channel += 1) channels[channel] += image.data[sampleOffset + channel];
+          samples += 1;
+        }
+      }
+      const offset = (y * image.width + x) * 4;
+      const gains = [0.88, 0.96, 1.04];
+      const offsets = [8, 3, 2];
+      for (let channel = 0; channel < 3; channel += 1) {
+        const noise = ((x * 17 + y * 31 + channel * 11) % 7) - 3;
+        data[offset + channel] = Math.max(0, Math.min(255, channels[channel] / samples * gains[channel] + offsets[channel] + noise));
+      }
+      data[offset + 3] = 255;
+    }
+  }
+  return { width: image.width, height: image.height, data };
+}
+
 function makeRenderedImage(packet: Uint8Array, matrixSize: number, includeLocator = true): PixelImage {
   const layout = createAztecLayout(matrixSize);
   const matrix = renderAztecFrameMatrix(packet, matrixSize);
@@ -272,6 +300,15 @@ test('transparent exterior pixels do not change frame detection', async () => {
   assert.deepStrictEqual(transparent.packet, opaque.packet);
 });
 
+test('receiver still accepts frames from older senders with an orange locator border', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(80, 72)], 'legacy-orange-boundary.bin'), 32);
+  const image = makeOpticalFrame(transfer.packets[0], 32, 0, 360, true);
+  const result = decodeOpticalFrameDetailed(image, 32);
+  assert.equal(result.status, 'packet-decoded', result.reason);
+  assert.equal(result.locatorDetected, true);
+  assert.deepStrictEqual(result.packet, transfer.packets[0]);
+});
+
 test('small image translations preserve detected frame corner accuracy', async () => {
   const transfer = await prepareAztecTransfer(new File([makePayload(80, 23)], 'translation-test.bin'), 32);
   const image = makeOpticalFrame(transfer.packets[0], 32);
@@ -302,7 +339,7 @@ test('receiver reacquires the frame when tracked corners no longer decode it', a
   const image = makeOpticalFrame(transfer.packets[0], 32);
   const baseline = decodeOpticalFrameDetailed(image, 32);
   assert.equal(baseline.status, 'packet-decoded', baseline.reason);
-  assert.equal(baseline.locatorDetected, true, 'generated frames should be located by their dedicated border');
+  assert.equal(baseline.locatorDetected, true, 'the orange frame marker should locate generated frames');
   assert.ok(baseline.corners);
   const shiftedImage = translateImage(image, 4, 3);
   const staleCorners = baseline.corners.map(({ x, y }) => ({ x: x + 12, y: y + 9 })) as typeof baseline.corners;
@@ -313,7 +350,7 @@ test('receiver reacquires the frame when tracked corners no longer decode it', a
   assert.ok(reacquired.candidateCount > 0, 'a failed tracked decode must trigger full candidate search');
 });
 
-test('receiver falls back to the original dark boundary when no locator border is present', async () => {
+test('receiver falls back to the dark boundary when no locator border is present', async () => {
   const transfer = await prepareAztecTransfer(new File([makePayload(80, 71)], 'legacy-boundary.bin'), 32);
   const unmarkedImage = makeOpticalFrame(transfer.packets[0], 32, 0, 720, false);
   const result = decodeOpticalFrameDetailed(unmarkedImage, 32);
@@ -392,11 +429,15 @@ test('renderer redraws every module and changes frame-dependent padding', async 
     getContext: () => context,
   } as unknown as HTMLCanvasElement;
   let fillStyle = '';
+  let extraColorFills = 0;
   let draws = new Map<number, string>();
   const context = {
     clearRect: () => { draws = new Map<number, string>(); },
     fillRect: (x: number, y: number, width: number, height: number) => {
-      if (width !== 6 || height !== 6) return;
+      if (width !== 6 || height !== 6) {
+        if (fillStyle !== '#FFFFFF') extraColorFills += 1;
+        return;
+      }
       assert.equal(width, 6);
       assert.equal(height, 6);
       draws.set(((y - 12) / 6) * size + (x - 12) / 6, fillStyle);
@@ -407,6 +448,7 @@ test('renderer redraws every module and changes frame-dependent padding', async 
 
   const first = drawAztecFrame(firstPacket, canvas, size);
   const firstMatrix = renderAztecFrameMatrix(firstPacket, size);
+  assert.equal(extraColorFills, 4, 'new frames should paint a clear orange locator border around the quiet zone');
   assert.equal(first.width, (size + 4) * 6);
   assert.equal(first.height, (size + 4) * 6);
   assert.equal(draws.size, size * size, 'every matrix module, including corners, must be redrawn');
@@ -422,6 +464,7 @@ test('renderer redraws every module and changes frame-dependent padding', async 
 
   const second = drawAztecFrame(nextPacket, canvas, size);
   const secondMatrix = renderAztecFrameMatrix(nextPacket, size);
+  assert.equal(extraColorFills, 8, 'successive frames should redraw the orange locator border');
   assert.equal(draws.size, size * size, 'the next frame must also redraw the complete matrix');
   assert.ok(second.changedModules > size * size * 0.2, 'a new frame must replace stale symbols across the data region');
   assert.equal(second.totalModules, size * size);
@@ -523,10 +566,19 @@ test('receiver uses CRC-backed color recovery for ambiguous module samples', asy
   const matrix = renderAztecFrameMatrix(packet, 32);
   const image = makeRenderedImage(packet, 32);
   const [x, y] = layout.dataCoordinates[42];
-  const sourceColor = COLORS[matrix[y * 32 + x]];
-  const alternateColor = COLORS[(matrix[y * 32 + x] + 1) % COLORS.length];
-  const sourceRgb = [1, 3, 5].map((offset) => parseInt(sourceColor.slice(offset, offset + 2), 16));
-  const alternateRgb = [1, 3, 5].map((offset) => parseInt(alternateColor.slice(offset, offset + 2), 16));
+  const sourceIndex = matrix[y * 32 + x];
+  const sourceRgb = [1, 3, 5].map((offset) => parseInt(COLORS[sourceIndex].slice(offset, offset + 2), 16));
+  let alternateRgb: number[] = [];
+  let nearestDistance = Infinity;
+  for (let color = 0; color < COLORS.length; color += 1) {
+    if (color === sourceIndex) continue;
+    const candidate = [1, 3, 5].map((offset) => parseInt(COLORS[color].slice(offset, offset + 2), 16));
+    const distance = Math.hypot(candidate[0] - sourceRgb[0], candidate[1] - sourceRgb[1], candidate[2] - sourceRgb[2]);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      alternateRgb = candidate;
+    }
+  }
   for (let pixelY = layout.matrixOffset + y * MODULE_PIXELS; pixelY < layout.matrixOffset + (y + 1) * MODULE_PIXELS; pixelY += 1) {
     for (let pixelX = layout.matrixOffset + x * MODULE_PIXELS; pixelX < layout.matrixOffset + (x + 1) * MODULE_PIXELS; pixelX += 1) {
       const offset = (pixelY * image.width + pixelX) * 4;
@@ -536,8 +588,54 @@ test('receiver uses CRC-backed color recovery for ambiguous module samples', asy
     }
   }
   const result = decodeOpticalFrameDetailed(image, 32);
-  assert.equal(result.status, 'packet-decoded', result.reason);
+  assert.equal(result.status, 'packet-decoded', `${result.reason}; confidence=${result.colourConfidence}; finder=${result.candidateConfidence}; corners=${JSON.stringify(result.corners)}`);
   assert.deepStrictEqual(result.packet, packet);
+});
+
+test('receiver corrects three low-confidence module colors when CRC validates the packet', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(100, 92)], 'three-color-errors.bin'), 32);
+  const packet = transfer.packets[0];
+  const layout = createAztecLayout(32);
+  const matrix = renderAztecFrameMatrix(packet, 32);
+  const image = makeRenderedImage(packet, 32);
+  const palette = COLORS.map((color) => [1, 3, 5].map((offset) => parseInt(color.slice(offset, offset + 2), 16)));
+  for (const index of [31, 83, 147]) {
+    const [x, y] = layout.dataCoordinates[index];
+    const sourceIndex = matrix[y * 32 + x];
+    const source = palette[sourceIndex];
+    let alternate = 0;
+    let nearestDistance = Infinity;
+    for (let color = 0; color < palette.length; color += 1) {
+      if (color === sourceIndex) continue;
+      const candidate = palette[color];
+      const distance = Math.hypot(candidate[0] - source[0], candidate[1] - source[1], candidate[2] - source[2]);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        alternate = color;
+      }
+    }
+    const alternateRgb = palette[alternate];
+    for (let pixelY = layout.matrixOffset + y * MODULE_PIXELS; pixelY < layout.matrixOffset + (y + 1) * MODULE_PIXELS; pixelY += 1) {
+      for (let pixelX = layout.matrixOffset + x * MODULE_PIXELS; pixelX < layout.matrixOffset + (x + 1) * MODULE_PIXELS; pixelX += 1) {
+        const offset = (pixelY * image.width + pixelX) * 4;
+        for (let channel = 0; channel < 3; channel += 1) {
+          image.data[offset + channel] = Math.round(source[channel] * 0.5 + alternateRgb[channel] * 0.5);
+        }
+      }
+    }
+  }
+  const result = decodeOpticalFrameDetailed(image, 32);
+  assert.equal(result.status, 'packet-decoded', `${result.reason}; confidence=${result.colourConfidence}; finder=${result.candidateConfidence}`);
+  assert.deepStrictEqual(result.packet, packet);
+});
+
+test('receiver decodes lower-resolution camera frames with blur, noise, and color cast', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(96, 95)], 'camera-noise.bin'), 32);
+  const image = addCameraBlurAndColorCast(makeOpticalFrame(transfer.packets[0], 32, 0, 360));
+  const result = decodeOpticalFrameDetailed(image, 32);
+  assert.equal(result.status, 'packet-decoded', `${result.reason}; confidence=${result.colourConfidence}; finder=${result.candidateConfidence}; corners=${JSON.stringify(result.corners)}`);
+  assert.equal(result.locatorDetected, true);
+  assert.deepStrictEqual(result.packet, transfer.packets[0]);
 });
 
 test('actual sender render decodes in the receiver pipeline at varied brightness', async () => {
@@ -560,7 +658,8 @@ test('actual sender render decodes in the receiver pipeline at varied brightness
     assert.deepStrictEqual(trace.packet, transfer.packets[0]);
   }
   const dimLocator = decodeOpticalFrameDetailed(scaleBrightness(image, 0.3), transfer.targetMatrixSize);
-  assert.equal(dimLocator.locatorDetected, true, 'the border should remain locatable under a substantial brightness drop');
+  assert.equal(dimLocator.status, 'packet-decoded', dimLocator.reason);
+  assert.equal(dimLocator.locatorDetected, true, 'the orange marker should remain detectable under reduced brightness');
   const firstDetection = decodeOpticalFrameDetailed(image, transfer.targetMatrixSize);
   assert.equal(firstDetection.status, 'packet-decoded');
   assert.equal(firstDetection.finderSizeModules, createAztecLayout(transfer.targetMatrixSize).finderSize);

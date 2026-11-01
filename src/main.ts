@@ -153,7 +153,7 @@ function updateDiagnostics(trace: Omit<DecoderTrace, 'packet'>, counts: WorkerDi
   diagnosticElements.frames.textContent = `${cameraFramesReceived} received`;
   diagnosticElements.processing.textContent = `${counts.frames} processed (${trace.imageWidth}×${trace.imageHeight})`;
   diagnosticElements.candidates.textContent = `${counts.candidatesDetected} total; ${trace.candidateCount} this frame`;
-  diagnosticElements.locator.textContent = trace.locatorDetected ? 'FOUND — orange border' : 'NOT FOUND — fallback search';
+  diagnosticElements.locator.textContent = trace.locatorDetected ? 'ORANGE MARKER FOUND' : trace.corners ? 'DARK FRAME FALLBACK' : 'SEARCHING';
   diagnosticElements.tracking.textContent = counts.trackingState;
   diagnosticElements.geometry.textContent = trace.geometryCandidates
     ? `ACCEPTED (${trace.geometryCandidates} this frame; ${counts.validGeometry} total)`
