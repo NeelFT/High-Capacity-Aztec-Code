@@ -21,7 +21,7 @@
     .meta { min-height: 22px; text-align: center; }
     .telemetry { color: #7fffd4; font-family: ui-monospace, monospace; font-size: .85rem; }
     #tx { display: block; width: min(92vw, 570px); height: min(92vw, 570px); max-width: 100%; background: #fff; image-rendering: pixelated; }
-    #camera { width: min(100%, 720px); background: #111; }
+    #camera { width: min(100%, 720px); max-height: 65vh; background: #111; object-fit: contain; }
     #receivePreview img, #receivePreview video { max-width: min(100%, 480px); max-height: 55vh; }
     #scanCanvas { display: none; }
     [hidden] { display: none !important; }
@@ -61,12 +61,12 @@
       </label>
       <button id="startButton" type="button">Start camera</button>
       <div id="receiveStatus" class="meta">Ready - press Start camera; scans calibrated color packets</div>
+      <div id="zoomHelp" class="meta">Camera zoom support is checked when the camera starts.</div>
       <div class="meta">Mobile Chrome requires HTTPS for camera access.</div>
       <div id="receiveProgress" class="meta"></div>
       <div id="receiveFileName" class="meta"></div>
       <div id="transferComplete" class="meta complete" hidden>Transfer Complete</div>
       <div id="receivePreview"></div>
-      <button id="saveButton" type="button" hidden>Save file</button>
     </section>
   </main>
   <canvas id="scanCanvas"></canvas>

@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Color Fountain Transfer</title>
-  <style>:root{--lightningcss-light: ;--lightningcss-dark:initial;color-scheme:dark;font-family:system-ui,sans-serif}body{color:#fff;background:#000;min-height:100vh;margin:0}main{justify-items:center;gap:12px;padding:20px;display:grid}.tabs,.controls{flex-wrap:wrap;justify-content:center;gap:8px;display:flex}button,input{min-height:38px;font:inherit;border-radius:6px;padding:7px 12px}button{color:#000;cursor:pointer;background:#fff;border:0}button:disabled{opacity:.45;cursor:not-allowed}.tabs button{color:#fff;background:#252525}.tabs button.active{color:#000;background:#fff}.protocols{justify-content:center;gap:6px;display:flex}.protocols button{color:#fff;background:#252525}.protocols button.active{color:#000;background:#fff}.panel{justify-items:center;gap:10px;width:min(100%,760px);display:grid}.meta{text-align:center;min-height:22px}.telemetry{color:#7fffd4;font-family:ui-monospace,monospace;font-size:.85rem}#tx{width:min(92vw,570px);max-width:100%;height:min(92vw,570px);image-rendering:pixelated;background:#fff;display:block}#camera{background:#111;width:min(100%,720px)}#receivePreview img,#receivePreview video{max-width:min(100%,480px);max-height:55vh}#scanCanvas{display:none}[hidden]{display:none!important}</style>
-  <script type="module" crossorigin src="/assets/sender-BaepqnNP.js"></script>
+  <style>:root{--lightningcss-light: ;--lightningcss-dark:initial;color-scheme:dark;font-family:system-ui,sans-serif}body{color:#fff;background:#000;min-height:100vh;margin:0}main{justify-items:center;gap:12px;padding:20px;display:grid}.tabs,.controls{flex-wrap:wrap;justify-content:center;gap:8px;display:flex}button,input{min-height:38px;font:inherit;border-radius:6px;padding:7px 12px}button{color:#000;cursor:pointer;background:#fff;border:0}button:disabled{opacity:.45;cursor:not-allowed}.tabs button{color:#fff;background:#252525}.tabs button.active{color:#000;background:#fff}.protocols{justify-content:center;gap:6px;display:flex}.protocols button{color:#fff;background:#252525}.protocols button.active{color:#000;background:#fff}.panel{justify-items:center;gap:10px;width:min(100%,760px);display:grid}.meta{text-align:center;min-height:22px}.telemetry{color:#7fffd4;font-family:ui-monospace,monospace;font-size:.85rem}#tx{width:min(92vw,570px);max-width:100%;height:min(92vw,570px);image-rendering:pixelated;background:#fff;display:block}#camera{object-fit:contain;background:#111;width:min(100%,720px);max-height:65vh}#receivePreview img,#receivePreview video{max-width:min(100%,480px);max-height:55vh}#scanCanvas{display:none}[hidden]{display:none!important}</style>
+  <script type="module" crossorigin src="/assets/sender-Bivmx__k.js"></script>
 </head>
 <body>
   <main>
@@ -41,14 +41,14 @@
       </label>
       <button id="startButton" type="button">Start camera</button>
       <div id="receiveStatus" class="meta">Ready - press Start camera; scans calibrated color packets</div>
+      <div id="zoomHelp" class="meta">Camera zoom support is checked when the camera starts.</div>
       <div class="meta">Mobile Chrome requires HTTPS for camera access.</div>
       <div id="receiveProgress" class="meta"></div>
       <div id="receiveFileName" class="meta"></div>
       <div id="transferComplete" class="meta complete" hidden>Transfer Complete</div>
       <div id="receivePreview"></div>
-      <button id="saveButton" type="button" hidden>Save file</button>
     </section>
   </main>
-  <canvas id="scanCanvas"></canvas>
+  <canvas id="scanCanvas"></canvas>
 </body>
 </html>

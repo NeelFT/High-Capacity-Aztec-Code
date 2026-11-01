@@ -4,6 +4,9 @@ A small experiment in moving a file from one screen to another with light. The a
 
 This is a custom visual-transfer format, not a standard Aztec barcode reader. It does not send the file over Wi-Fi or through a server; the data travels in the changing colors on the sender's screen.
 
+The sender and receiver must use the same matrix size. Transfers are limited to 16 MiB and may be further limited by the selected matrix's packet capacity and the protocol's block-count limit. Every packet is checked with CRC32, and the receiver only downloads the reconstructed file after its SHA-256 digest matches the sender's metadata.
+File names and MIME types are limited to 120 UTF-8 bytes each; files with longer metadata are rejected rather than renamed or relabeled during transfer.
+
 ## Try it locally
 
 You need Node.js 20.19 or newer.
@@ -18,12 +21,12 @@ Open the local HTTPS address printed by Vite. The receiver uses the browser came
 ## Send a file
 
 1. On the sending device, open the app and choose a file.
-2. Pick a matrix size. The current choices are 63 x 63 and 95 x 95; use the same size on both devices.
+2. Pick a matrix size. The current choices are 63 x 63 and 95 x 95; use the same size on both devices. A larger matrix carries more data per frame but needs a larger, sharper image from the camera.
 3. Press **Send**. The color frame will keep cycling until you stop it.
 4. On the receiving device, open the same app, choose **Receive**, and press **Start camera**.
 5. Point the camera at the sender's screen and keep the full frame in view. When enough packets have been decoded, the reconstructed file downloads automatically.
 
-The sender includes the original blocks plus a small set of repair packets, then repeats the sequence. That gives the receiver another chance to collect missing data if a frame is blurred or missed. A steady, bright screen, a focused camera, and low glare help; larger matrix sizes carry more data per frame but need a clearer view.
+The sender includes the original blocks plus repair packets, then repeats the sequence. That gives the receiver another chance to collect missing data if a frame is blurred or missed. A steady, bright screen, a focused camera, and low glare help. Keep the whole frame visible and large in the camera preview; use the camera zoom control if the browser/device offers it. Camera permission requires HTTPS (or localhost), and some mobile browsers restrict camera access when the page is opened from an insecure LAN address.
 
 ## Build
 
