@@ -269,9 +269,12 @@ test('renderer redraws every module and changes frame-dependent padding', async 
 });
 
 test('32x32 frames carry and decode valid packets while 24x24 remains below protocol capacity', async () => {
-  const file = new File([makePayload(12, 41)], 'small.bin', { type: 'application/octet-stream' });
+  const file = new File([new TextEncoder().encode('HCAC test')], 'hcac-self-test.txt', { type: 'text/plain' });
   const transfer = await prepareAztecTransfer(file, 32);
   assert.equal(transfer.targetMatrixSize, 32);
+  assert.equal(transfer.blockCount, 1, 'the 32x32 decoder self-test must fit in one frame');
+  assert.equal(createAztecLayout(32).frameSize, 216);
+  assert.equal(renderAztecFrameMatrix(transfer.packets[0], 32).length, 32 * 32);
   assert.ok(transfer.blockSize > 0);
   const trace = decodeOpticalFrameDetailed(makeRenderedImage(transfer.packets[0], 32), 32);
   assert.equal(trace.status, 'packet-decoded', trace.reason);
@@ -382,9 +385,9 @@ test('matrix and file size limits reject unsupported input', async () => {
   await assert.rejects(prepareAztecTransfer(new File([], 'too-small-matrix.bin'), 31), /cannot fit a safe fountain packet/);
 });
 
-test('camera decoder rectifies perspective and identifies quarter-turn orientation', async () => {
+test('32x32 and 63x63 camera frames rectify perspective and identify quarter-turn orientation', async () => {
   const file = new File([new Uint8Array([0x12, 0x34, 0x56, 0x78, 0x90])], 'camera.bin');
-  for (const matrixSize of [63, 95]) {
+  for (const matrixSize of [32, 63]) {
     const transfer = await prepareAztecTransfer(file, matrixSize);
     const packet = transfer.packets[0];
     for (const rotation of [0, 1, 2, 3]) {

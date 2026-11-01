@@ -413,17 +413,15 @@ function handleWorkerMessage(message: WorkerResponse): void {
   stopReceiver();
 }
 
-fileInput.onchange = async () => {
-  const file = fileInput.files?.[0];
-  if (!file) return;
+async function prepareSelectedFile(file: File, matrixSize: number): Promise<void> {
   const generation = ++prepareGeneration;
   transfer = null;
   sendButton.disabled = true;
+  frameCount.textContent = '';
   fileName.textContent = file.name;
-  sendStatus.textContent = 'Preparing fountain blocks...';
+  sendStatus.textContent = `Preparing ${matrixSize}×${matrixSize} transfer...`;
   try {
     if (file.size > MAX_FILE_BYTES) throw new Error(`Files larger than ${MAX_FILE_BYTES / (1024 * 1024)} MiB are not supported.`);
-    const matrixSize = Number(targetMatrixInput.value);
     const prepared = await prepareAztecTransfer(file, matrixSize, (current, total) => {
       if (generation === prepareGeneration) sendStatus.textContent = `Preparing source block ${current} of ${total}...`;
     });
@@ -437,6 +435,24 @@ fileInput.onchange = async () => {
     if (generation !== prepareGeneration) return;
     sendStatus.textContent = error instanceof Error ? error.message : 'Could not prepare file.';
   }
+}
+
+fileInput.onchange = () => {
+  const file = fileInput.files?.[0];
+  if (file) void prepareSelectedFile(file, Number(targetMatrixInput.value));
+};
+
+targetMatrixInput.onchange = () => {
+  const file = fileInput.files?.[0];
+  if (file) {
+    void prepareSelectedFile(file, Number(targetMatrixInput.value));
+    return;
+  }
+  prepareGeneration += 1;
+  transfer = null;
+  sendButton.disabled = true;
+  frameCount.textContent = '';
+  sendStatus.textContent = 'Choose a file';
 };
 
 sendButton.onclick = async () => {
@@ -446,6 +462,12 @@ sendButton.onclick = async () => {
     return;
   }
   if (!transfer) return;
+  const selectedMatrixSize = Number(targetMatrixInput.value);
+  if (transfer.targetMatrixSize !== selectedMatrixSize) {
+    const file = fileInput.files?.[0];
+    if (file) void prepareSelectedFile(file, selectedMatrixSize);
+    return;
+  }
   const activeTransfer = transfer;
   const generation = ++senderGeneration;
   sending = true;
@@ -518,7 +540,7 @@ decoderTestButton.onclick = async () => {
   decoderTestButton.disabled = true;
   try {
     const matrixSize = Number(targetMatrixInput.value);
-    const testBytes = new TextEncoder().encode('HCAC optical decoder self-test');
+    const testBytes = new TextEncoder().encode('HCAC test');
     const testFile = new File([testBytes], 'hcac-self-test.txt', { type: 'text/plain' });
     const prepared = await prepareAztecTransfer(testFile, matrixSize);
     const renderCanvas = document.createElement('canvas');
