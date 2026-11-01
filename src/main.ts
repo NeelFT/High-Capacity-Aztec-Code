@@ -36,6 +36,7 @@ const diagnosticElements = {
   frames: document.getElementById('diagFrames') as HTMLElement,
   processing: document.getElementById('diagProcessing') as HTMLElement,
   candidates: document.getElementById('diagCandidates') as HTMLElement,
+  locator: document.getElementById('diagLocator') as HTMLElement,
   tracking: document.getElementById('diagTracking') as HTMLElement,
   geometry: document.getElementById('diagGeometry') as HTMLElement,
   confidence: document.getElementById('diagConfidence') as HTMLElement,
@@ -152,6 +153,7 @@ function updateDiagnostics(trace: Omit<DecoderTrace, 'packet'>, counts: WorkerDi
   diagnosticElements.frames.textContent = `${cameraFramesReceived} received`;
   diagnosticElements.processing.textContent = `${counts.frames} processed (${trace.imageWidth}×${trace.imageHeight})`;
   diagnosticElements.candidates.textContent = `${counts.candidatesDetected} total; ${trace.candidateCount} this frame`;
+  diagnosticElements.locator.textContent = trace.locatorDetected ? 'FOUND — orange border' : 'NOT FOUND — fallback search';
   diagnosticElements.tracking.textContent = counts.trackingState;
   diagnosticElements.geometry.textContent = trace.geometryCandidates
     ? `ACCEPTED (${trace.geometryCandidates} this frame; ${counts.validGeometry} total)`
@@ -376,6 +378,7 @@ function resetReceiveState(): void {
   diagnosticElements.frames.textContent = '0 received';
   diagnosticElements.processing.textContent = '0 processed';
   diagnosticElements.candidates.textContent = '0 candidates';
+  diagnosticElements.locator.textContent = 'WAITING';
   diagnosticElements.tracking.textContent = 'SEARCHING';
   diagnosticElements.geometry.textContent = 'WAITING';
   diagnosticElements.confidence.textContent = 'Not measured';
@@ -540,6 +543,7 @@ function runWorkerDecodeTest(image: ImageData, matrixSize: number, label: string
   const testWorker = new Worker(new URL('./decoder.worker.ts', import.meta.url), { type: 'module' });
   return new Promise<void>((resolve) => {
     let finished = false;
+    let locatorDetected = false;
     const finish = (message: string): void => {
       if (finished) return;
       finished = true;
@@ -553,11 +557,12 @@ function runWorkerDecodeTest(image: ImageData, matrixSize: number, label: string
       const message = event.data;
       if (message.type === 'diagnostic') {
         const trace = message.trace;
-        decoderTestStatus.textContent = `${label}: ${statusForTrace(trace, message.counts)}; geometry ${trace.geometryCandidates ? 'accepted' : 'failed'}; colours ${trace.recognizedModules}/${trace.totalModules}; header ${trace.headerValid ?? 'not reached'}; CRC ${trace.crcValid ?? 'not reached'}; ${trace.reason}`;
+        locatorDetected = trace.locatorDetected;
+        decoderTestStatus.textContent = `${label}: ${statusForTrace(trace, message.counts)}; ${locatorDetected ? 'orange locator found' : 'dark-border fallback'}; geometry ${trace.geometryCandidates ? 'accepted' : 'failed'}; colours ${trace.recognizedModules}/${trace.totalModules}; header ${trace.headerValid ?? 'not reached'}; CRC ${trace.crcValid ?? 'not reached'}; ${trace.reason}`;
       } else if (message.type === 'packet') {
         decoderTestStatus.textContent = `${label}: packet ${message.frameId} accepted; recovered ${message.solved}/${message.blockCount} blocks.`;
       } else if (message.type === 'complete') {
-        finish(`${label}: COMPLETE — geometry, colour decoding, CRC32 and SHA-256 verified; packet ${message.unique ? 'accepted' : 'decoded'}, ${message.solved} block(s) recovered.`);
+        finish(`${label}: COMPLETE — ${locatorDetected ? 'orange locator found; ' : 'dark-border fallback used; '}geometry, colour decoding, CRC32 and SHA-256 verified; packet ${message.unique ? 'accepted' : 'decoded'}, ${message.solved} block(s) recovered.`);
       } else if (message.type === 'error') {
         finish(`${label}: FAILED — ${message.message}`);
       }

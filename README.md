@@ -21,14 +21,16 @@ Open the **Network** HTTPS address printed by Vite on each device (for example, 
 ## Send a file
 
 1. On the sending device, open the app and choose a file.
-2. Pick a matrix size. The available transfer sizes are 32 x 32 and 63 x 63; use the same size on both devices. A larger matrix carries more data per frame but needs a larger, sharper image from the camera.
+2. Use the supported 32 x 32 matrix on both devices.
 3. Press **Send**. The color frame will keep cycling until you stop it.
 4. On the receiving device, open the same app, choose **Receive**, and press **Start camera**.
 5. Point the camera at the sender's screen and keep the full frame in view. When enough packets have been decoded, the reconstructed file downloads automatically.
 
 The sender includes the original blocks plus repair packets, then repeats the sequence. That gives the receiver another chance to collect missing data if a frame is blurred or missed. A steady, bright screen, a focused camera, and low glare help. Keep the whole frame visible and large in the camera preview; use the camera zoom control if the browser/device offers it. Camera permission requires HTTPS (or localhost), and some mobile browsers restrict camera access when the page is opened from an insecure LAN address.
 
-The visual layout uses a centered, one-module alternating-ring bullseye: 8 x 8 modules for the even 32 x 32 matrix and 9 x 9 for the odd 63 x 63 matrix. The one-module parity difference keeps both finders exactly centered on the module grid. Alignment tracks are outside the finder, and the renderer and decoder share the same matrix geometry and two-module white quiet zone.
+The receiver classifies modules using a robust center sample and calibrates against the on-frame color palette. It can correct up to two ambiguous color symbols when packet CRC32 confirms the correction. Each valid packet is also stored locally in IndexedDB by transfer session and frame ID; collected packets can arrive in any order and are restored when scanning resumes. Saved packets are cleared after SHA-256 verification.
+
+The visual layout uses a centered, one-module alternating-ring bullseye: 8 x 8 modules for the even 32 x 32 matrix and 9 x 9 for the odd 63 x 63 matrix. The one-module parity difference keeps both finders exactly centered on the module grid. Alignment tracks are outside the finder. A dedicated orange locator border in the quiet zone lets the receiver find the stream boundary separately from payload colors; receivers still fall back to dark-boundary detection for older frames.
 
 Every frame spreads the eight palette colors across its data modules, excluding the bullseye and structural guides. The sender applies a reversible packet-seeded color mask after the fixed header and balances unused padding modules; packet bytes, CRC, and capacity are unchanged. The receiver accepts both the current seeded mapping and earlier frames that used the fixed color mask.
 

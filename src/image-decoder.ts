@@ -1,4 +1,5 @@
 import { COLORS, colorSymbolMask, createAztecLayout, decode3BitPacketDetailed, decode3BitPayload, HEADER_BYTES, readU32 } from './aztec.ts';
+import type { PacketDecodeResult } from './aztec.ts';
 import type { AztecLayout } from './aztec.ts';
 
 export interface PixelImage {
@@ -36,6 +37,7 @@ export interface DecoderTrace {
   gridLines: Array<[FramePoint, FramePoint]>;
   packet: Uint8Array | null;
   reason: string;
+  locatorDetected: boolean;
 }
 
 type Transform = (x: number, y: number) => FramePoint;
@@ -56,29 +58,32 @@ function isDarkPixel(image: PixelImage, x: number, y: number): boolean {
   return red <= 65 && green <= 65 && blue <= 65;
 }
 
-function findFrameCandidates(image: PixelImage): FrameCorners[] {
-  const step = Math.max(1, Math.floor(Math.min(image.width, image.height) / 480));
+function isLocatorPixel(image: PixelImage, x: number, y: number): boolean {
+  const offset = (y * image.width + x) * 4;
+  const alpha = image.data[offset + 3] / 255;
+  const red = image.data[offset] * alpha + 255 * (1 - alpha);
+  const green = image.data[offset + 1] * alpha + 255 * (1 - alpha);
+  const blue = image.data[offset + 2] * alpha + 255 * (1 - alpha);
+  return red - green > 24 && green - blue > 18 && red > green * 1.2 && green > blue * 1.2;
+}
+
+interface FrameCandidate {
+  corners: FrameCorners;
+  boundaryOffset: number;
+}
+
+function findMaskComponents(image: PixelImage, mask: Uint8Array, step: number, boundaryOffset: number): Array<FrameCandidate & { score: number }> {
   const columns = Math.ceil(image.width / step);
   const rows = Math.ceil(image.height / step);
   const pixelCount = columns * rows;
-  const dark = new Uint8Array(pixelCount);
-  for (let y = 0; y < rows; y += 1) {
-    for (let x = 0; x < columns; x += 1) {
-      const sourceX = Math.min(image.width - 1, x * step);
-      const sourceY = Math.min(image.height - 1, y * step);
-      if (!isDarkPixel(image, sourceX, sourceY)) continue;
-      dark[y * columns + x] = 1;
-    }
-  }
-
   const queue = new Int32Array(pixelCount);
-  const candidates: Array<{ corners: FrameCorners; score: number }> = [];
+  const candidates: Array<FrameCandidate & { score: number }> = [];
   for (let start = 0; start < pixelCount; start += 1) {
-    if (!dark[start]) continue;
+    if (!mask[start]) continue;
     let head = 0;
     let tail = 0;
     queue[tail++] = start;
-    dark[start] = 0;
+    mask[start] = 0;
     let count = 0;
     let minX = columns;
     let maxX = -1;
@@ -109,23 +114,23 @@ function findFrameCandidates(image: PixelImage): FrameCorners[] {
       if (sum > maxSum) { maxSum = sum; bottomRight = point; }
       if (difference < minDifference) { minDifference = difference; bottomLeft = point; }
       const left = current - 1;
-      if (x > 0 && dark[left]) {
-        dark[left] = 0;
+      if (x > 0 && mask[left]) {
+        mask[left] = 0;
         queue[tail++] = left;
       }
       const right = current + 1;
-      if (x + 1 < columns && dark[right]) {
-        dark[right] = 0;
+      if (x + 1 < columns && mask[right]) {
+        mask[right] = 0;
         queue[tail++] = right;
       }
       const above = current - columns;
-      if (y > 0 && dark[above]) {
-        dark[above] = 0;
+      if (y > 0 && mask[above]) {
+        mask[above] = 0;
         queue[tail++] = above;
       }
       const below = current + columns;
-      if (y + 1 < rows && dark[below]) {
-        dark[below] = 0;
+      if (y + 1 < rows && mask[below]) {
+        mask[below] = 0;
         queue[tail++] = below;
       }
     }
@@ -140,13 +145,36 @@ function findFrameCandidates(image: PixelImage): FrameCorners[] {
     const density = count / Math.max(1, width * height / (step * step));
     candidates.push({
       corners: [topLeft, topRight, bottomRight, bottomLeft],
+      boundaryOffset,
       score: areaRatio * (1 - Math.min(1, density)),
     });
   }
-  return candidates.sort((a, b) => b.score - a.score).slice(0, 8).map(({ corners }) => corners);
+  return candidates;
 }
 
-function validateFrameGeometry(image: PixelImage, corners: FrameCorners): string | null {
+function findFrameCandidates(image: PixelImage): FrameCandidate[] {
+  const step = Math.max(1, Math.floor(Math.min(image.width, image.height) / 480));
+  const columns = Math.ceil(image.width / step);
+  const rows = Math.ceil(image.height / step);
+  const darkMask = new Uint8Array(columns * rows);
+  const locatorMask = new Uint8Array(columns * rows);
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < columns; x += 1) {
+      const sourceX = Math.min(image.width - 1, x * step);
+      const sourceY = Math.min(image.height - 1, y * step);
+      const index = y * columns + x;
+      if (isDarkPixel(image, sourceX, sourceY)) darkMask[index] = 1;
+      if (isLocatorPixel(image, sourceX, sourceY)) locatorMask[index] = 1;
+    }
+  }
+  const candidates = [
+    ...findMaskComponents(image, locatorMask, step, 1),
+    ...findMaskComponents(image, darkMask, step, 0),
+  ];
+  return candidates.sort((a, b) => b.score - a.score).slice(0, 8);
+}
+
+function validateFrameGeometry(image: PixelImage, corners: FrameCorners, locatorDetected: boolean): string | null {
   const minDimension = Math.min(image.width, image.height);
   for (let index = 0; index < corners.length; index += 1) {
     const current = corners[index];
@@ -163,7 +191,10 @@ function validateFrameGeometry(image: PixelImage, corners: FrameCorners): string
     return sum + point.x * next.y - next.x * point.y;
   }, 0)) / 2;
   if (area < image.width * image.height * 0.08) return 'Candidate covers less than 8% of the camera image.';
-  if (area > image.width * image.height * 0.92) return 'Candidate fills more than 92% of the camera image; the full matrix boundary is not isolated.';
+  const maximumAreaRatio = locatorDetected ? 0.98 : 0.92;
+  if (area > image.width * image.height * maximumAreaRatio) {
+    return `Candidate fills more than ${maximumAreaRatio * 100}% of the camera image; the full matrix boundary is not isolated.`;
+  }
   const centerX = corners.reduce((sum, point) => sum + point.x, 0) / 4;
   const centerY = corners.reduce((sum, point) => sum + point.y, 0) / 4;
   if (Math.abs(centerX - image.width / 2) > image.width * 0.35 || Math.abs(centerY - image.height / 2) > image.height * 0.35) {
@@ -182,12 +213,14 @@ function validateFrameGeometry(image: PixelImage, corners: FrameCorners): string
   return null;
 }
 
-function createTransform(corners: FrameCorners, size: number): Transform | null {
+function createTransform(corners: FrameCorners, size: number, boundaryOffset = 0): Transform | null {
+  const start = -boundaryOffset;
+  const end = size + boundaryOffset;
   const destinations = [
-    { x: 0, y: 0 },
-    { x: size, y: 0 },
-    { x: size, y: size },
-    { x: 0, y: size },
+    { x: start, y: start },
+    { x: end, y: start },
+    { x: end, y: end },
+    { x: start, y: end },
   ];
   const matrix: number[][] = [];
   for (let index = 0; index < 4; index += 1) {
@@ -224,21 +257,25 @@ function createTransform(corners: FrameCorners, size: number): Transform | null 
 }
 
 function averageColor(image: PixelImage, transform: Transform, cellX: number, cellY: number): [number, number, number] {
-  let red = 0;
-  let green = 0;
-  let blue = 0;
-  for (const offsetY of [0.32, 0.68]) {
-    for (const offsetX of [0.32, 0.68]) {
+  const red: number[] = [];
+  const green: number[] = [];
+  const blue: number[] = [];
+  for (const offsetY of [0.25, 0.5, 0.75]) {
+    for (const offsetX of [0.25, 0.5, 0.75]) {
       const point = transform(cellX + offsetX, cellY + offsetY);
       const x = Math.max(0, Math.min(image.width - 1, Math.round(point.x)));
       const y = Math.max(0, Math.min(image.height - 1, Math.round(point.y)));
       const offset = (y * image.width + x) * 4;
-      red += image.data[offset];
-      green += image.data[offset + 1];
-      blue += image.data[offset + 2];
+      red.push(image.data[offset]);
+      green.push(image.data[offset + 1]);
+      blue.push(image.data[offset + 2]);
     }
   }
-  return [red / 4, green / 4, blue / 4];
+  const median = (channel: number[]): number => {
+    channel.sort((a, b) => a - b);
+    return channel[Math.floor(channel.length / 2)];
+  };
+  return [median(red), median(green), median(blue)];
 }
 
 function rgbToLab([red, green, blue]: [number, number, number]): LabColor {
@@ -259,9 +296,10 @@ function rgbToLab([red, green, blue]: [number, number, number]): LabColor {
   return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
 }
 
-function nearestPaletteColor(color: [number, number, number], referenceLabs: LabColor[]): { index: number; nearest: number; margin: number } {
+function nearestPaletteColor(color: [number, number, number], referenceLabs: LabColor[]): { index: number; secondIndex: number; nearest: number; margin: number } {
   const sampleLab = rgbToLab(color);
   let bestIndex = -1;
+  let secondIndex = -1;
   let nearest = Infinity;
   let secondNearest = Infinity;
   for (let index = 0; index < referenceLabs.length; index += 1) {
@@ -269,13 +307,62 @@ function nearestPaletteColor(color: [number, number, number], referenceLabs: Lab
     const distance = Math.hypot(sampleLab[0] - reference[0], sampleLab[1] - reference[1], sampleLab[2] - reference[2]);
     if (distance < nearest) {
       secondNearest = nearest;
+      secondIndex = bestIndex;
       nearest = distance;
       bestIndex = index;
     } else if (distance < secondNearest) {
       secondNearest = distance;
+      secondIndex = index;
     }
   }
-  return { index: bestIndex, nearest, margin: secondNearest - nearest };
+  return { index: bestIndex, secondIndex, nearest, margin: secondNearest - nearest };
+}
+
+function decodeWithSupportedMasks(symbols: Uint8Array): PacketDecodeResult {
+  const fixedHeaderSymbols = Math.ceil(HEADER_BYTES * 8 / 3);
+  const legacySymbols = symbols.map((symbol, index) => symbol ^ colorSymbolMask(index));
+  const legacyDecoded = decode3BitPacketDetailed(legacySymbols);
+  if (legacyDecoded.status === 'decoded' || symbols.length < fixedHeaderSymbols) return legacyDecoded;
+  const fixedHeader = decode3BitPayload(legacySymbols.subarray(0, fixedHeaderSymbols), HEADER_BYTES * 8);
+  const maskSeed = readU32(new DataView(fixedHeader.buffer, fixedHeader.byteOffset, fixedHeader.byteLength), 8);
+  const seededSymbols = symbols.map((symbol, index) =>
+    symbol ^ colorSymbolMask(index, index < fixedHeaderSymbols ? 0 : maskSeed));
+  const seededDecoded = decode3BitPacketDetailed(seededSymbols);
+  const statusRank = { 'header-invalid': 0, 'crc-failed': 1, decoded: 2 } as const;
+  return statusRank[seededDecoded.status] > statusRank[legacyDecoded.status] ? seededDecoded : legacyDecoded;
+}
+
+function recoverColorErrors(symbols: Uint8Array, alternatives: Array<{ index: number; symbol: number; margin: number }>): PacketDecodeResult {
+  const initial = decodeWithSupportedMasks(symbols);
+  if (initial.status === 'decoded') return initial;
+  const likely = alternatives.sort((a, b) => a.margin - b.margin).slice(0, 128);
+  for (let first = 0; first < likely.length; first += 1) {
+    const candidate = likely[first];
+    const original = symbols[candidate.index];
+    symbols[candidate.index] = candidate.symbol;
+    const decoded = decodeWithSupportedMasks(symbols);
+    symbols[candidate.index] = original;
+    if (decoded.status === 'decoded') return decoded;
+  }
+  const pairCandidates = likely.slice(0, 16);
+  for (let first = 0; first < pairCandidates.length; first += 1) {
+    const firstCandidate = pairCandidates[first];
+    const firstOriginal = symbols[firstCandidate.index];
+    symbols[firstCandidate.index] = firstCandidate.symbol;
+    for (let second = first + 1; second < pairCandidates.length; second += 1) {
+      const secondCandidate = pairCandidates[second];
+      const secondOriginal = symbols[secondCandidate.index];
+      symbols[secondCandidate.index] = secondCandidate.symbol;
+      const decoded = decodeWithSupportedMasks(symbols);
+      symbols[secondCandidate.index] = secondOriginal;
+      if (decoded.status === 'decoded') {
+        symbols[firstCandidate.index] = firstOriginal;
+        return decoded;
+      }
+    }
+    symbols[firstCandidate.index] = firstOriginal;
+  }
+  return initial;
 }
 
 function makeGridLines(transform: Transform, size: number): Array<[FramePoint, FramePoint]> {
@@ -298,7 +385,7 @@ function candidateOrientations(candidate: FrameCorners): FrameCorners[] {
   return orientations;
 }
 
-function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameCorners): DecoderTrace {
+function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameCorners, boundaryOffset = 0): DecoderTrace {
   const base: DecoderTrace = {
     status: 'geometry-failed',
     candidateCount: 1,
@@ -321,13 +408,14 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
     gridLines: [],
     packet: null,
     reason: '',
+    locatorDetected: boundaryOffset > 0,
   };
-  const geometryError = validateFrameGeometry(image, corners);
+  const geometryError = validateFrameGeometry(image, corners, boundaryOffset > 0);
   if (geometryError) {
     base.reason = geometryError;
     return base;
   }
-  const transform = createTransform(corners, layout.targetMatrixSize);
+  const transform = createTransform(corners, layout.targetMatrixSize, boundaryOffset);
   if (!transform) {
     base.reason = 'Perspective transform could not be calculated from the candidate corners.';
     return base;
@@ -367,42 +455,21 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
   base.orientationFound = true;
 
   const symbols = new Uint8Array(layout.dataCoordinates.length);
+  const alternatives: Array<{ index: number; symbol: number; margin: number }> = [];
   let recognizedModules = 0;
   let totalMargin = 0;
-  let firstRejected: { x: number; y: number; distance: number; margin: number } | null = null;
   for (let index = 0; index < layout.dataCoordinates.length; index += 1) {
     const [x, y] = layout.dataCoordinates[index];
     const classified = nearestPaletteColor(averageColor(image, transform, x, y), referenceLabs);
     totalMargin += Math.max(0, classified.margin);
-    if (classified.nearest > 45 || classified.margin < 4) {
-      firstRejected ??= { x, y, distance: classified.nearest, margin: classified.margin };
-    } else {
-      recognizedModules += 1;
-    }
+    recognizedModules += 1;
+    if (classified.secondIndex >= 0) alternatives.push({ index, symbol: classified.secondIndex, margin: classified.margin });
     symbols[index] = classified.index;
   }
   base.gridSampled = true;
   base.recognizedModules = recognizedModules;
   base.colourConfidence = totalMargin / Math.max(1, layout.dataCoordinates.length);
-  if (firstRejected) {
-    base.status = 'colour-recognition-failed';
-    base.reason = `Module (${firstRejected.x}, ${firstRejected.y}) is ambiguous: ΔE ${firstRejected.distance.toFixed(1)}, palette margin ${firstRejected.margin.toFixed(1)}; thresholds are 45 and 4.`;
-    return base;
-  }
-
-  const fixedHeaderSymbols = Math.ceil(HEADER_BYTES * 8 / 3);
-  const legacySymbols = symbols.map((symbol, index) => symbol ^ colorSymbolMask(index));
-  const legacyDecoded = decode3BitPacketDetailed(legacySymbols);
-  let decoded = legacyDecoded;
-  if (legacyDecoded.status !== 'decoded' && symbols.length >= fixedHeaderSymbols) {
-    const fixedHeader = decode3BitPayload(legacySymbols.subarray(0, fixedHeaderSymbols), HEADER_BYTES * 8);
-    const maskSeed = readU32(new DataView(fixedHeader.buffer, fixedHeader.byteOffset, fixedHeader.byteLength), 8);
-    const seededSymbols = symbols.map((symbol, index) =>
-      symbol ^ colorSymbolMask(index, index < fixedHeaderSymbols ? 0 : maskSeed));
-    const seededDecoded = decode3BitPacketDetailed(seededSymbols);
-    const statusRank = { 'header-invalid': 0, 'crc-failed': 1, decoded: 2 } as const;
-    if (statusRank[seededDecoded.status] > statusRank[legacyDecoded.status]) decoded = seededDecoded;
-  }
+  const decoded = recoverColorErrors(symbols, alternatives);
   base.headerValid = decoded.headerValid;
   base.crcValid = decoded.crcValid;
   base.packet = decoded.packet;
@@ -416,19 +483,25 @@ export interface OpticalFrameResult {
   corners: FrameCorners;
 }
 
-export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: number, trackedCorners?: FrameCorners | null): DecoderTrace {
+export function decodeOpticalFrameDetailed(
+  image: PixelImage,
+  targetMatrixSize: number,
+  trackedCorners?: FrameCorners | null,
+  trackedLocator = false,
+): DecoderTrace {
   const layout = createAztecLayout(targetMatrixSize);
+  let trackedTrace: DecoderTrace | null = null;
   if (trackedCorners) {
-    const trackedTrace = decodeCandidate(image, layout, trackedCorners);
+    trackedTrace = decodeCandidate(image, layout, trackedCorners, trackedLocator ? 1 : 0);
     trackedTrace.trackedCandidate = true;
     trackedTrace.candidateCount = 0;
-    if (trackedTrace.geometryCandidates && trackedTrace.orientationFound) return trackedTrace;
+    if (trackedTrace.status === 'packet-decoded') return trackedTrace;
   }
   const detectedCandidates = findFrameCandidates(image);
-  const candidates = detectedCandidates.map((corners) => ({ corners, tracked: false }));
-  if (trackedCorners && !detectedCandidates.some((candidate) => candidate.every((point, index) =>
-    Math.hypot(point.x - trackedCorners[index].x, point.y - trackedCorners[index].y) < 3))) {
-    candidates.push({ corners: trackedCorners, tracked: true });
+  const candidates = detectedCandidates.map((candidate) => ({ ...candidate, tracked: false }));
+  if (trackedCorners && !detectedCandidates.some((candidate) => candidate.corners.every((point, index) =>
+    Math.hypot(point.x - trackedCorners[index].x, point.y - trackedCorners[index].y) < 1))) {
+    candidates.push({ corners: trackedCorners, boundaryOffset: trackedLocator ? 1 : 0, tracked: true });
   }
   if (candidates.length === 0) {
     return {
@@ -452,14 +525,15 @@ export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: 
       corners: null,
       gridLines: [],
       packet: null,
-      reason: 'No square dark frame boundary was found in the camera image.',
+      reason: 'No orange locator border or dark frame boundary was found in the camera image.',
+      locatorDetected: false,
     };
   }
   const candidateCount = detectedCandidates.length;
-  let best: DecoderTrace | null = null;
+  let best: DecoderTrace | null = trackedTrace;
   for (const candidate of candidates) {
     for (const corners of candidateOrientations(candidate.corners)) {
-      const trace = decodeCandidate(image, layout, corners);
+      const trace = decodeCandidate(image, layout, corners, candidate.boundaryOffset);
       trace.candidateCount = candidateCount;
       trace.trackedCandidate = candidate.tracked;
       if (!best || trace.geometryCandidates > best.geometryCandidates ||
@@ -494,11 +568,17 @@ export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: 
     gridLines: [],
     packet: null,
     reason: 'No valid matrix orientation was found.',
+    locatorDetected: false,
   };
 }
 
-export function decodeOpticalFrame(image: PixelImage, targetMatrixSize: number, trackedCorners?: FrameCorners | null): (OpticalFrameResult & { trace?: DecoderTrace }) | null {
-  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, trackedCorners);
+export function decodeOpticalFrame(
+  image: PixelImage,
+  targetMatrixSize: number,
+  trackedCorners?: FrameCorners | null,
+  trackedLocator = false,
+): (OpticalFrameResult & { trace?: DecoderTrace }) | null {
+  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, trackedCorners, trackedLocator);
   if (!trace.packet || !trace.corners) return null;
   return { packet: trace.packet, corners: trace.corners, trace };
 }

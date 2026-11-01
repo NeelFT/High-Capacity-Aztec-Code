@@ -48,8 +48,7 @@
     <div class="protocols" aria-label="Matrix size">
       <label for="targetMatrixSize">Matrix size</label>
       <select id="targetMatrixSize">
-        <option value="32">32 x 32</option>
-        <option value="63" selected>63 x 63</option>
+        <option value="32" selected>32 x 32</option>
       </select>
       <span>custom scalable color fountain stream</span>
     </div>
@@ -82,7 +81,7 @@
         <button id="decoderTestButton" type="button">Run decoder self-test</button>
         <label>Decode saved frame <input id="savedFrameInput" type="file" accept="image/*"></label>
       </div>
-      <div id="decoderTestStatus" class="meta" aria-live="polite">Self-test uses the production renderer, decoder, CRC and reconstruction worker.</div>
+      <div id="decoderTestStatus" class="meta" aria-live="polite">Valid packets are saved in this browser and combined in any order; resume scanning the same transfer later if needed.</div>
       <section class="diagnostics" aria-labelledby="diagnosticHeading">
         <h2 id="diagnosticHeading">Receiver diagnostics</h2>
         <dl class="diagnostic-grid">
@@ -90,6 +89,7 @@
           <div><dt>Camera frames</dt><dd id="diagFrames">0 received</dd></div>
           <div><dt>Image processing</dt><dd id="diagProcessing">0 processed</dd></div>
           <div><dt>Candidate detection</dt><dd id="diagCandidates">0 candidates</dd></div>
+          <div><dt>Locator border</dt><dd id="diagLocator">WAITING</dd></div>
           <div><dt>Tracking state</dt><dd id="diagTracking">SEARCHING</dd></div>
           <div><dt>Geometry</dt><dd id="diagGeometry">WAITING</dd></div>
           <div><dt>Candidate confidence</dt><dd id="diagConfidence">Not measured</dd></div>

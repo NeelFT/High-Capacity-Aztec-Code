@@ -1,6 +1,7 @@
 import { crc32, FountainEquationSolver, MAX_BLOCK_COUNT, MAX_EQUATION_DEGREE, MAX_FILE_BYTES, readU16, readU32, sha256Hex } from './aztec';
 import { decodeOpticalFrameDetailed } from './image-decoder';
 import type { DecoderTrace, FrameCorners, PixelImage } from './image-decoder';
+import { deleteReceivedPackets, loadReceivedPackets, saveReceivedPacket } from './packet-store';
 import type { WorkerDiagnostics, WorkerRequest, WorkerResponse } from './worker-protocol';
 
 let lastSession: number | null = null;
@@ -13,6 +14,7 @@ let totalBytes = 0;
 let metadata: { name: string; type: string; hash: string } | null = null;
 let targetMatrixSize = 63;
 let lastCorners: FrameCorners | null = null;
+let lastLocatorDetected = false;
 let trackedImageSize: [number, number] | null = null;
 let trackingMisses = 0;
 let trackingFrames = 0;
@@ -39,6 +41,7 @@ const diagnosticCounts: WorkerDiagnostics = {
 };
 const receivedFrames = new Set<number>();
 let solver: FountainEquationSolver | null = null;
+let hydratedSession: number | null = null;
 
 function postWorkerMessage(message: WorkerResponse, transfer?: Transferable[]): void {
   (self as unknown as { postMessage(value: WorkerResponse, transfer?: Transferable[]): void }).postMessage(message, transfer);
@@ -84,6 +87,7 @@ function updateTracking(trace: DecoderTrace): void {
     trackingFrames = 0;
     if (!lastCorners || trackingMisses > 4) {
       lastCorners = null;
+      lastLocatorDetected = false;
       trackedImageSize = null;
       diagnosticCounts.trackingState = 'SEARCHING';
     } else {
@@ -131,6 +135,7 @@ function rememberCorners(trace: DecoderTrace): void {
   } else {
     lastCorners = trace.corners;
   }
+  lastLocatorDetected = trace.locatorDetected;
   trackedImageSize = [trace.imageWidth, trace.imageHeight];
 }
 
@@ -222,6 +227,66 @@ function parseMetadata(value: Uint8Array): { name: string; type: string; hash: s
   }
 }
 
+function acceptPacket(parsed: NonNullable<ReturnType<typeof parsePacket>>, trace: DecoderTrace): boolean {
+  if (parsed.session !== lastSession) {
+    rejectPacket(trace, 'Packet belongs to a different transfer session.', true);
+    return false;
+  }
+  if (parsed.count !== blockCount && blockCount !== 0) {
+    rejectPacket(trace, 'Packet block count does not match the active transfer.', true);
+    return false;
+  }
+  if (parsed.size !== blockSize && blockSize !== 0) {
+    rejectPacket(trace, 'Packet block size does not match the active transfer.', true);
+    return false;
+  }
+  if (parsed.total !== totalBytes && blockCount !== 0) {
+    rejectPacket(trace, 'Packet file size does not match the active transfer.', true);
+    return false;
+  }
+  if (blockCount === 0) {
+    blockCount = parsed.count;
+    blockSize = parsed.size;
+    totalBytes = parsed.total;
+  }
+  if (parsed.metadata[0] === 1) {
+    const parsedMetadata = parseMetadata(parsed.metadata);
+    if (!parsedMetadata) {
+      rejectPacket(trace, 'Transfer metadata is malformed or contains an invalid UTF-8 name, MIME type, or SHA-256 digest.', true);
+      return false;
+    }
+    metadata = parsedMetadata;
+  } else if (parsed.metadata.length !== 1 || parsed.metadata[0] !== 0) {
+    rejectPacket(trace, 'Packet metadata flag or length is invalid.', true);
+    return false;
+  }
+  if (!solver) solver = new FountainEquationSolver(blockCount, blockSize);
+  if (receivedFrames.has(parsed.frameId)) return false;
+  if (!solver.addEquation(parsed.indices, parsed.data)) {
+    rejectPacket(trace, 'Fountain equation conflicts with already received packet data.', true);
+    return false;
+  }
+  receivedFrames.add(parsed.frameId);
+  decodedCount += 1;
+  diagnosticCounts.packets += 1;
+  diagnosticCounts.lastPacketId = parsed.frameId;
+  diagnosticCounts.uniqueBlocks = solver.solved.size;
+  diagnosticCounts.verification = 'IN_PROGRESS';
+  return true;
+}
+
+async function restorePacketsForSession(session: number, trace: DecoderTrace): Promise<void> {
+  const savedPackets = await loadReceivedPackets(session);
+  for (const saved of savedPackets) {
+    const parsed = parsePacket(saved.packet);
+    if (!parsed || parsed.session !== session || parsed.frameId !== saved.frameId) {
+      diagnosticCounts.latestError = `Saved packet ${saved.frameId} failed validation and was ignored.`;
+      continue;
+    }
+    acceptPacket(parsed, trace);
+  }
+}
+
 function resetSession(value: number): void {
   lastSession = value;
   decodedCount = 0;
@@ -232,6 +297,7 @@ function resetSession(value: number): void {
   metadata = null;
   receivedFrames.clear();
   solver = null;
+  hydratedSession = null;
 }
 
 async function completeIfSolved(): Promise<void> {
@@ -258,6 +324,12 @@ async function completeIfSolved(): Promise<void> {
   }
   completionSent = true;
   diagnosticCounts.verification = 'VERIFIED';
+  try {
+    await deleteReceivedPackets(lastSession ?? 0);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Unknown IndexedDB error.';
+    diagnosticCounts.latestError = `File verified, but saved packet cleanup failed: ${reason}`;
+  }
   if (latestTrace) reportDiagnostic(latestTrace);
   postWorkerMessage({
     type: 'complete',
@@ -278,12 +350,13 @@ async function publish(image: PixelImage): Promise<void> {
   if (completionSent) return;
   if (trackedImageSize && (trackedImageSize[0] !== image.width || trackedImageSize[1] !== image.height)) {
     lastCorners = null;
+    lastLocatorDetected = false;
     trackedImageSize = null;
     trackingMisses = 0;
     trackingFrames = 0;
   }
   const trackedCorners = trackingMisses < 3 ? lastCorners : null;
-  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, trackedCorners);
+  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, trackedCorners, lastLocatorDetected);
   latestTrace = trace;
   updateTracking(trace);
   updateTrace(trace);
@@ -299,59 +372,39 @@ async function publish(image: PixelImage): Promise<void> {
 
   if (lastSession !== null && parsed.session !== lastSession) resetSession(parsed.session);
   if (lastSession === null) resetSession(parsed.session);
-  if (parsed.count !== blockCount && blockCount !== 0) {
-    rejectPacket(trace, 'Packet block count does not match the active transfer.', true);
-    return;
-  }
-  if (parsed.size !== blockSize && blockSize !== 0) {
-    rejectPacket(trace, 'Packet block size does not match the active transfer.', true);
-    return;
-  }
-  if (parsed.total !== totalBytes && blockCount !== 0) {
-    rejectPacket(trace, 'Packet file size does not match the active transfer.', true);
-    return;
-  }
-  if (blockCount === 0) {
-    blockCount = parsed.count;
-    blockSize = parsed.size;
-    totalBytes = parsed.total;
-  }
-  if (parsed.metadata[0] === 1) {
-    const parsedMetadata = parseMetadata(parsed.metadata);
-    if (!parsedMetadata) {
-      rejectPacket(trace, 'Transfer metadata is malformed or contains an invalid UTF-8 name, MIME type, or SHA-256 digest.', true);
-      return;
+  if (hydratedSession !== parsed.session) {
+    hydratedSession = parsed.session;
+    try {
+      await restorePacketsForSession(parsed.session, trace);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unknown IndexedDB error.';
+      diagnosticCounts.latestError = `Could not restore saved packets; current live scan can still continue: ${reason}`;
     }
-    metadata = parsedMetadata;
-  } else if (parsed.metadata.length !== 1 || parsed.metadata[0] !== 0) {
-    rejectPacket(trace, 'Packet metadata flag or length is invalid.', true);
-    return;
   }
-  if (!solver) solver = new FountainEquationSolver(blockCount, blockSize);
-  if (receivedFrames.has(parsed.frameId)) {
+  const accepted = acceptPacket(parsed, trace);
+  if (!accepted && receivedFrames.has(parsed.frameId)) {
     reportDiagnostic(trace);
     return;
   }
-  if (!solver.addEquation(parsed.indices, parsed.data)) {
-    rejectPacket(trace, 'Fountain equation conflicts with already received packet data.', true);
-    return;
+  if (!accepted) return;
+  try {
+    await saveReceivedPacket(parsed.session, parsed.frameId, trace.packet);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Unknown IndexedDB error.';
+    diagnosticCounts.latestError = `Packet accepted for this scan but could not be saved for later: ${reason}`;
   }
-  receivedFrames.add(parsed.frameId);
-  decodedCount += 1;
-  diagnosticCounts.packets += 1;
-  diagnosticCounts.lastPacketId = parsed.frameId;
-  diagnosticCounts.uniqueBlocks = solver.solved.size;
-  diagnosticCounts.verification = 'IN_PROGRESS';
   reportDiagnostic(trace);
   await completeIfSolved();
-  diagnosticCounts.uniqueBlocks = solver.solved.size;
+  const activeSolver = solver;
+  if (!activeSolver) throw new Error('The receiver lost its fountain solver after accepting a packet.');
+  diagnosticCounts.uniqueBlocks = activeSolver.solved.size;
   postWorkerMessage({
     type: 'packet',
     frameId: parsed.frameId,
     session: parsed.session,
     decodedCount,
     blockCount,
-    solved: solver.solved.size,
+    solved: activeSolver.solved.size,
     name: metadata?.name,
   });
 }
@@ -362,6 +415,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     resetSession(0);
     lastSession = null;
     lastCorners = null;
+    lastLocatorDetected = false;
     trackedImageSize = null;
     trackingMisses = 0;
     trackingFrames = 0;
@@ -372,6 +426,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     resetSession(0);
     lastSession = null;
     lastCorners = null;
+    lastLocatorDetected = false;
     trackedImageSize = null;
     trackingMisses = 0;
     trackingFrames = 0;

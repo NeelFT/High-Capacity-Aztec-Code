@@ -4,6 +4,7 @@ export const FINDER_RING_THICKNESS = 1;
 export const MODULE_PIXELS = 6;
 export const QUIET_ZONE_MODULES = 2;
 export const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF', '#FFFFFF'] as const;
+export const LOCATOR_COLOR = '#FF8000';
 export const REDUNDANCY = 1.5;
 export const MAX_FILE_BYTES = 16 * 1024 * 1024;
 export const MAX_BLOCK_COUNT = 32767;
@@ -554,14 +555,24 @@ function renderDataColors(packet: Uint8Array, layout: AztecLayout): Uint8Array {
     colors[index] = color;
     counts[color] += 1;
   }
-  for (let index = symbols.length; index < colors.length; index += 1) {
+  const paddingColors = new Uint8Array(colors.length - symbols.length);
+  for (let index = 0; index < paddingColors.length; index += 1) {
     let leastUsedColor = 0;
     for (let color = 1; color < counts.length; color += 1) {
       if (counts[color] < counts[leastUsedColor]) leastUsedColor = color;
     }
-    colors[index] = leastUsedColor;
+    paddingColors[index] = leastUsedColor;
     counts[leastUsedColor] += 1;
   }
+  const frameId = packet.length >= 4
+    ? readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), 0)
+    : 0;
+  const shuffle = seededRandom(maskSeed ^ frameId ^ 0xa5a5a5a5);
+  for (let index = paddingColors.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(shuffle() * (index + 1));
+    [paddingColors[index], paddingColors[swapIndex]] = [paddingColors[swapIndex], paddingColors[index]];
+  }
+  colors.set(paddingColors, symbols.length);
   return colors;
 }
 
@@ -638,8 +649,9 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
         if (frameId === 0) {
           let bestSpread = dataPaletteSpread(packet, layout);
           let bestPacket = packet.slice();
-          for (let attempt = 0; attempt < 15; attempt += 1) {
-            writeU32(view, 8, randomU32());
+          const initialSeed = readU32(view, 8);
+          for (let attempt = 1; attempt <= 32; attempt += 1) {
+            writeU32(view, 8, (initialSeed ^ Math.imul(attempt, 0x9e3779b9)) >>> 0);
             const checksumOffset = packet.length - 4;
             writeU32(view, checksumOffset, crc32(packet.subarray(0, checksumOffset)));
             const spread = dataPaletteSpread(packet, layout);
@@ -698,6 +710,13 @@ export function drawAztecFrame(packet: Uint8Array, canvas: HTMLCanvasElement, ta
   context.clearRect(0, 0, layout.frameSize, layout.frameSize);
   context.fillStyle = '#FFFFFF';
   context.fillRect(0, 0, layout.frameSize, layout.frameSize);
+  const locatorInset = layout.matrixOffset - MODULE_PIXELS;
+  const locatorSize = layout.frameSize - locatorInset * 2;
+  context.fillStyle = LOCATOR_COLOR;
+  context.fillRect(locatorInset, locatorInset, locatorSize, MODULE_PIXELS);
+  context.fillRect(locatorInset, locatorInset + locatorSize - MODULE_PIXELS, locatorSize, MODULE_PIXELS);
+  context.fillRect(locatorInset, locatorInset, MODULE_PIXELS, locatorSize);
+  context.fillRect(locatorInset + locatorSize - MODULE_PIXELS, locatorInset, MODULE_PIXELS, locatorSize);
   for (let y = 0; y < layout.targetMatrixSize; y += 1) {
     for (let x = 0; x < layout.targetMatrixSize; x += 1) {
       context.fillStyle = COLORS[matrix[y * layout.targetMatrixSize + x]];
