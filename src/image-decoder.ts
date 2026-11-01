@@ -47,6 +47,15 @@ const paletteRgb = COLORS.map((color) => [
   parseInt(color.slice(5, 7), 16),
 ]);
 
+function isDarkPixel(image: PixelImage, x: number, y: number): boolean {
+  const offset = (y * image.width + x) * 4;
+  const alpha = image.data[offset + 3] / 255;
+  const red = image.data[offset] * alpha + 255 * (1 - alpha);
+  const green = image.data[offset + 1] * alpha + 255 * (1 - alpha);
+  const blue = image.data[offset + 2] * alpha + 255 * (1 - alpha);
+  return red <= 65 && green <= 65 && blue <= 65;
+}
+
 function findFrameCandidates(image: PixelImage): FrameCorners[] {
   const step = Math.max(1, Math.floor(Math.min(image.width, image.height) / 480));
   const columns = Math.ceil(image.width / step);
@@ -57,8 +66,7 @@ function findFrameCandidates(image: PixelImage): FrameCorners[] {
     for (let x = 0; x < columns; x += 1) {
       const sourceX = Math.min(image.width - 1, x * step);
       const sourceY = Math.min(image.height - 1, y * step);
-      const offset = (sourceY * image.width + sourceX) * 4;
-      if (image.data[offset] > 65 || image.data[offset + 1] > 65 || image.data[offset + 2] > 65) continue;
+      if (!isDarkPixel(image, sourceX, sourceY)) continue;
       dark[y * columns + x] = 1;
     }
   }
@@ -135,7 +143,7 @@ function findFrameCandidates(image: PixelImage): FrameCorners[] {
       score: areaRatio * (1 - Math.min(1, density)),
     });
   }
-  return candidates.sort((a, b) => b.score - a.score).slice(0, 4).map(({ corners }) => corners);
+  return candidates.sort((a, b) => b.score - a.score).slice(0, 8).map(({ corners }) => corners);
 }
 
 function validateFrameGeometry(image: PixelImage, corners: FrameCorners): string | null {

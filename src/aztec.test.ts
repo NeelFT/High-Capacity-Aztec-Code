@@ -133,6 +133,104 @@ function makeOpticalFrame(packet: Uint8Array, matrixSize: number, rotation = 0, 
   return { width, height, data: output };
 }
 
+function makeTransparentExterior(image: PixelImage): PixelImage {
+  const data = new Uint8ClampedArray(image.data);
+  const visited = new Uint8Array(image.width * image.height);
+  const queue = new Int32Array(image.width * image.height);
+  let head = 0;
+  let tail = 0;
+  const addIfExteriorWhite = (x: number, y: number): void => {
+    if (x < 0 || x >= image.width || y < 0 || y >= image.height) return;
+    const index = y * image.width + x;
+    if (visited[index]) return;
+    const offset = index * 4;
+    if (data[offset] !== 255 || data[offset + 1] !== 255 || data[offset + 2] !== 255 || data[offset + 3] === 0) return;
+    visited[index] = 1;
+    queue[tail++] = index;
+  };
+  for (let x = 0; x < image.width; x += 1) {
+    addIfExteriorWhite(x, 0);
+    addIfExteriorWhite(x, image.height - 1);
+  }
+  for (let y = 0; y < image.height; y += 1) {
+    addIfExteriorWhite(0, y);
+    addIfExteriorWhite(image.width - 1, y);
+  }
+  while (head < tail) {
+    const index = queue[head++];
+    const x = index % image.width;
+    const y = Math.floor(index / image.width);
+    const offset = index * 4;
+    data[offset] = 0;
+    data[offset + 1] = 0;
+    data[offset + 2] = 0;
+    data[offset + 3] = 0;
+    addIfExteriorWhite(x - 1, y);
+    addIfExteriorWhite(x + 1, y);
+    addIfExteriorWhite(x, y - 1);
+    addIfExteriorWhite(x, y + 1);
+  }
+  return { width: image.width, height: image.height, data };
+}
+
+function translateImage(image: PixelImage, dx: number, dy: number): PixelImage {
+  const data = new Uint8ClampedArray(image.width * image.height * 4);
+  for (let index = 0; index < image.width * image.height; index += 1) {
+    data[index * 4] = 255;
+    data[index * 4 + 1] = 255;
+    data[index * 4 + 2] = 255;
+    data[index * 4 + 3] = 255;
+  }
+  for (let y = 0; y < image.height; y += 1) {
+    const targetY = y + dy;
+    if (targetY < 0 || targetY >= image.height) continue;
+    for (let x = 0; x < image.width; x += 1) {
+      const targetX = x + dx;
+      if (targetX < 0 || targetX >= image.width) continue;
+      const sourceOffset = (y * image.width + x) * 4;
+      const targetOffset = (targetY * image.width + targetX) * 4;
+      data.set(image.data.subarray(sourceOffset, sourceOffset + 4), targetOffset);
+    }
+  }
+  return { width: image.width, height: image.height, data };
+}
+
+test('transparent exterior pixels do not change frame detection', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(80, 19)], 'transparent-test.bin'), 32);
+  const image = makeOpticalFrame(transfer.packets[0], 32);
+  const opaque = decodeOpticalFrameDetailed(image, 32);
+  const transparent = decodeOpticalFrameDetailed(makeTransparentExterior(image), 32);
+  assert.equal(opaque.status, 'packet-decoded', opaque.reason);
+  assert.equal(transparent.status, 'packet-decoded', transparent.reason);
+  assert.equal(transparent.candidateCount, opaque.candidateCount);
+  assert.deepStrictEqual(transparent.packet, opaque.packet);
+});
+
+test('small image translations preserve detected frame corner accuracy', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(80, 23)], 'translation-test.bin'), 32);
+  const image = makeOpticalFrame(transfer.packets[0], 32);
+  const baseline = decodeOpticalFrameDetailed(image, 32);
+  const dx = 4;
+  const dy = 3;
+  const shifted = decodeOpticalFrameDetailed(translateImage(image, dx, dy), 32);
+  assert.equal(baseline.status, 'packet-decoded', baseline.reason);
+  assert.equal(shifted.status, 'packet-decoded', shifted.reason);
+  assert.ok(baseline.candidateCount > 0);
+  assert.ok(shifted.candidateCount > 0);
+  assert.ok(baseline.corners && shifted.corners);
+  let minimumMaximumError = Infinity;
+  for (let shift = 0; shift < 4; shift += 1) {
+    let maximumError = 0;
+    for (let index = 0; index < 4; index += 1) {
+      const expected = baseline.corners[index];
+      const actual = shifted.corners[(index + shift) % 4];
+      maximumError = Math.max(maximumError, Math.hypot(actual.x - expected.x - dx, actual.y - expected.y - dy));
+    }
+    minimumMaximumError = Math.min(minimumMaximumError, maximumError);
+  }
+  assert.ok(minimumMaximumError <= 2, `translated corners drifted by ${minimumMaximumError.toFixed(2)} pixels`);
+});
+
 test('3-bit payload round trips for all final alignments', () => {
   for (let length = 0; length <= 64; length += 1) {
     const bytes = makePayload(length, 17 + length);
@@ -443,7 +541,7 @@ test('32x32 and 63x63 camera frames rectify perspective and identify quarter-tur
       for (const rotation of [0, 1, 2, 3]) {
         const image = makeOpticalFrame(packet, matrixSize, rotation, imageSize);
         const decoded = decodeOpticalFrame(image, matrixSize);
-        if (!decoded) throw new Error(`Failed to decode ${matrixSize}x${matrixSize} perspective frame at ${imageSize}px and ${rotation * 90} degrees.`);
+        if (!decoded) throw new Error(`Failed to decode ${matrixSize}x${matrixSize} perspective frame at ${imageSize}px and ${rotation * 90} degrees: ${decodeOpticalFrameDetailed(image, matrixSize).reason}`);
         assert.deepStrictEqual(decoded.packet, packet, `packet mismatch for ${matrixSize}x${matrixSize} at ${imageSize}px and ${rotation * 90} degrees`);
       }
     }
