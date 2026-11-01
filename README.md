@@ -21,7 +21,7 @@ Open the local HTTPS address printed by Vite. The receiver uses the browser came
 ## Send a file
 
 1. On the sending device, open the app and choose a file.
-2. Pick a matrix size. The available transfer sizes are 32 x 32 and 63 x 63; use the same size on both devices. A larger matrix carries more data per frame but needs a larger, sharper image from the camera. Sizes from 24 x 24 through 29 x 29 cannot fit even the smallest valid packet with the current CRC and SHA-256 metadata format; 24 x 24 is shown as unavailable.
+2. Pick a matrix size. The available transfer sizes are 32 x 32 and 63 x 63; use the same size on both devices. A larger matrix carries more data per frame but needs a larger, sharper image from the camera.
 3. Press **Send**. The color frame will keep cycling until you stop it.
 4. On the receiving device, open the same app, choose **Receive**, and press **Start camera**.
 5. Point the camera at the sender's screen and keep the full frame in view. When enough packets have been decoded, the reconstructed file downloads automatically.
