@@ -16,7 +16,7 @@ npm ci
 npm run dev
 ```
 
-Open the local HTTPS address printed by Vite. The receiver uses the browser camera, which requires a secure page (HTTPS, or `localhost`). Accept the local development certificate warning if your browser shows one.
+Open the **Network** HTTPS address printed by Vite on each device (for example, `https://192.168.1.20:5173/`), not `localhost` on the phone. The server binds to all network interfaces on the fixed port 5173; Vite exits with a clear error if that port is already in use rather than silently switching to a port that may not be allowed through the firewall. The development certificate includes the computer's current LAN addresses. It is not issued by a public certificate authority, so each device must trust or proceed past the development-certificate warning before the browser will load the page. Camera access requires HTTPS (or `localhost`).
 
 ## Send a file
 
