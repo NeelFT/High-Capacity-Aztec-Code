@@ -30,7 +30,7 @@ The sender includes the original blocks plus repair packets, then repeats the se
 
 The visual layout uses a centered, one-module alternating-ring bullseye: 8 x 8 modules for the even 32 x 32 matrix and 9 x 9 for the odd 63 x 63 matrix. The one-module parity difference keeps both finders exactly centered on the module grid. Alignment tracks are outside the finder, and the renderer and decoder share the same matrix geometry and two-module white quiet zone.
 
-Every generated frame is checked to include all eight protocol colors across its data modules, excluding the bullseye and structural guides. If needed, packet seeds are retried; packet encoding, decoder compatibility, and data capacity are unchanged.
+Every frame spreads the eight palette colors across its data modules, excluding the bullseye and structural guides. The sender applies a reversible packet-seeded color mask after the fixed header and balances unused padding modules; packet bytes, CRC, and capacity are unchanged. The receiver accepts both the current seeded mapping and earlier frames that used the fixed color mask.
 
 ## Diagnose and test the receiver
 

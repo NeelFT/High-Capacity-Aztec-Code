@@ -1,4 +1,4 @@
-import { COLORS, colorSymbolMask, createAztecLayout, decode3BitPacketDetailed } from './aztec.ts';
+import { COLORS, colorSymbolMask, createAztecLayout, decode3BitPacketDetailed, decode3BitPayload, HEADER_BYTES, readU32 } from './aztec.ts';
 import type { AztecLayout } from './aztec.ts';
 
 export interface PixelImage {
@@ -379,7 +379,7 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
     } else {
       recognizedModules += 1;
     }
-    symbols[index] = classified.index ^ colorSymbolMask(index);
+    symbols[index] = classified.index;
   }
   base.gridSampled = true;
   base.recognizedModules = recognizedModules;
@@ -390,7 +390,19 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
     return base;
   }
 
-  const decoded = decode3BitPacketDetailed(symbols);
+  const fixedHeaderSymbols = Math.ceil(HEADER_BYTES * 8 / 3);
+  const legacySymbols = symbols.map((symbol, index) => symbol ^ colorSymbolMask(index));
+  const legacyDecoded = decode3BitPacketDetailed(legacySymbols);
+  let decoded = legacyDecoded;
+  if (legacyDecoded.status !== 'decoded' && symbols.length >= fixedHeaderSymbols) {
+    const fixedHeader = decode3BitPayload(legacySymbols.subarray(0, fixedHeaderSymbols), HEADER_BYTES * 8);
+    const maskSeed = readU32(new DataView(fixedHeader.buffer, fixedHeader.byteOffset, fixedHeader.byteLength), 8);
+    const seededSymbols = symbols.map((symbol, index) =>
+      symbol ^ colorSymbolMask(index, index < fixedHeaderSymbols ? 0 : maskSeed));
+    const seededDecoded = decode3BitPacketDetailed(seededSymbols);
+    const statusRank = { 'header-invalid': 0, 'crc-failed': 1, decoded: 2 } as const;
+    if (statusRank[seededDecoded.status] > statusRank[legacyDecoded.status]) decoded = seededDecoded;
+  }
   base.headerValid = decoded.headerValid;
   base.crcValid = decoded.crcValid;
   base.packet = decoded.packet;

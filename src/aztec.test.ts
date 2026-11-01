@@ -195,6 +195,52 @@ function translateImage(image: PixelImage, dx: number, dy: number): PixelImage {
   return { width: image.width, height: image.height, data };
 }
 
+function makeLegacyRenderedImage(packet: Uint8Array, matrixSize: number): PixelImage {
+  const image = makeRenderedImage(packet, matrixSize);
+  const data = new Uint8ClampedArray(image.data);
+  const layout = createAztecLayout(matrixSize);
+  const symbols = encode3BitPayload(packet);
+  const frameId = new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint32(0, true);
+  const rgb = COLORS.map((color) => [
+    parseInt(color.slice(1, 3), 16),
+    parseInt(color.slice(3, 5), 16),
+    parseInt(color.slice(5, 7), 16),
+  ]);
+  for (let index = 0; index < layout.dataCoordinates.length; index += 1) {
+    let colorIndex = symbols[index] ?? 0;
+    if (index >= symbols.length) {
+      let state = (frameId ^ Math.imul(index + 1, 0x9e3779b9)) >>> 0;
+      state = (Math.imul(state ^ (state >>> 16), 0x45d9f3b) + 0x27100001) >>> 0;
+      state ^= state >>> 13;
+      colorIndex = state & 0x7;
+    }
+    colorIndex = (colorIndex ^ colorSymbolMask(index)) & 0x7;
+    const [moduleX, moduleY] = layout.dataCoordinates[index];
+    const [red, green, blue] = rgb[colorIndex];
+    for (let y = 0; y < MODULE_PIXELS; y += 1) {
+      for (let x = 0; x < MODULE_PIXELS; x += 1) {
+        const pixelX = layout.matrixOffset + moduleX * MODULE_PIXELS + x;
+        const pixelY = layout.matrixOffset + moduleY * MODULE_PIXELS + y;
+        const offset = (pixelY * image.width + pixelX) * 4;
+        data[offset] = red;
+        data[offset + 1] = green;
+        data[offset + 2] = blue;
+        data[offset + 3] = 255;
+      }
+    }
+  }
+  return { width: image.width, height: image.height, data };
+}
+
+function assertBalancedDataPalette(matrix: Uint8Array, layout: ReturnType<typeof createAztecLayout>, context: string): void {
+  const counts = new Uint16Array(COLORS.length);
+  for (const [x, y] of layout.dataCoordinates) counts[matrix[y * layout.targetMatrixSize + x]] += 1;
+  assert.equal(counts.filter((count) => count > 0).length, COLORS.length, `${context}: all palette colors must appear`);
+  const spread = Math.max(...counts) - Math.min(...counts);
+  const maxSpread = Math.ceil(layout.dataCoordinates.length / COLORS.length * 0.4);
+  assert.ok(spread <= maxSpread, `${context}: color count spread ${spread} exceeds ${maxSpread}`);
+}
+
 test('transparent exterior pixels do not change frame detection', async () => {
   const transfer = await prepareAztecTransfer(new File([makePayload(80, 19)], 'transparent-test.bin'), 32);
   const image = makeOpticalFrame(transfer.packets[0], 32);
@@ -390,8 +436,7 @@ test('32x32 frames carry and decode valid packets while 24x24 remains below prot
   assert.equal(renderAztecFrameMatrix(transfer.packets[0], 32).length, 32 * 32);
   for (const packet of transfer.packets) {
     const matrix = renderAztecFrameMatrix(packet, 32);
-    const dataPalette = new Set(layout.dataCoordinates.map(([x, y]) => matrix[y * 32 + x]));
-    assert.equal(dataPalette.size, COLORS.length, 'every frame data area must contain all eight colors');
+    assertBalancedDataPalette(matrix, layout, `32x32 packet ${new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint32(0, true)}`);
     const trace = decodeOpticalFrameDetailed(makeRenderedImage(packet, 32), 32);
     assert.equal(trace.status, 'packet-decoded', trace.reason);
     assert.deepStrictEqual(trace.packet, packet);
@@ -408,8 +453,7 @@ test('actual sender render decodes in the receiver pipeline at varied brightness
   const layout = createAztecLayout(transfer.targetMatrixSize);
   for (const packet of transfer.packets) {
     const matrix = renderAztecFrameMatrix(packet, transfer.targetMatrixSize);
-    const dataPalette = new Set(layout.dataCoordinates.map(([x, y]) => matrix[y * transfer.targetMatrixSize + x]));
-    assert.equal(dataPalette.size, COLORS.length, 'every frame data area must contain all eight colors');
+    assertBalancedDataPalette(matrix, layout, `${transfer.targetMatrixSize}x${transfer.targetMatrixSize} packet ${new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint32(0, true)}`);
   }
   for (const brightness of [0.7, 1, 1.15]) {
     const trace = decodeOpticalFrameDetailed(scaleBrightness(image, brightness), transfer.targetMatrixSize);
@@ -429,6 +473,9 @@ test('actual sender render decodes in the receiver pipeline at varied brightness
   assert.equal(trackedFrame.status, 'packet-decoded', trackedFrame.reason);
   assert.equal(trackedFrame.trackedCandidate, true);
   assert.equal(trackedFrame.candidateCount, 0, 'tracked reads must not inflate newly detected candidate counts');
+  const legacyFrame = decodeOpticalFrameDetailed(makeLegacyRenderedImage(transfer.packets[0], transfer.targetMatrixSize), transfer.targetMatrixSize);
+  assert.equal(legacyFrame.status, 'packet-decoded', `legacy color mapping failed: ${legacyFrame.reason}`);
+  assert.deepStrictEqual(legacyFrame.packet, transfer.packets[0]);
   const corruptedPacket = transfer.packets[0].slice();
   corruptedPacket[corruptedPacket.length - 5] ^= 0x80;
   const trackedCrcFailure = decodeOpticalFrameDetailed(
