@@ -1,5 +1,6 @@
 export const FINDER_SIZE = 15;
 export const MODULE_PIXELS = 6;
+export const QUIET_ZONE_MODULES = 2;
 export const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF', '#FFFFFF'] as const;
 export const REDUNDANCY = 1.5;
 export const MAX_FILE_BYTES = 16 * 1024 * 1024;
@@ -14,6 +15,7 @@ const MAX_METADATA_BYTES = 3 + 120 + 120 + 64;
 export interface AztecLayout {
   targetMatrixSize: number;
   frameSize: number;
+  matrixOffset: number;
   dataCoordinates: Array<[number, number]>;
   alignmentCoordinates: Set<string>;
   grid: Array<Array<string | null>>;
@@ -142,31 +144,53 @@ export function decode3BitPayload(symbols: Uint8Array, bitLength: number): Uint8
   return output;
 }
 
-export function decode3BitPacket(symbols: Uint8Array): Uint8Array | null {
+export interface PacketDecodeResult {
+  status: 'header-invalid' | 'crc-failed' | 'decoded';
+  headerValid: boolean;
+  crcValid: boolean | null;
+  packet: Uint8Array | null;
+  reason: string | null;
+}
+
+export function decode3BitPacketDetailed(symbols: Uint8Array): PacketDecodeResult {
   const headerBytes = HEADER_BYTES + 9;
   const headerSymbolCount = Math.ceil(headerBytes * 8 / 3);
-  if (symbols.length < headerSymbolCount) return null;
+  if (symbols.length < headerSymbolCount) {
+    return { status: 'header-invalid', headerValid: false, crcValid: null, packet: null, reason: 'Not enough symbols to read the packet header.' };
+  }
 
   const header = decode3BitPayload(symbols.subarray(0, headerSymbolCount), headerBytes * 8);
   const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
   const blockCount = readU16(view, HEADER_BYTES + 4);
   const blockSize = readU16(view, HEADER_BYTES + 6);
   const degree = header[HEADER_BYTES + 8];
-  if (!blockCount || !blockSize || degree < 1 || degree > blockCount || degree > MAX_EQUATION_DEGREE) return null;
+  if (!blockCount || !blockSize || degree < 1 || degree > blockCount || degree > MAX_EQUATION_DEGREE) {
+    return { status: 'header-invalid', headerValid: false, crcValid: null, packet: null, reason: 'Header block count, block size, or equation degree is outside protocol limits.' };
+  }
 
   const metadataLengthOffset = headerBytes + degree * 2;
   const metadataLengthSymbolCount = Math.ceil((metadataLengthOffset + 1) * 8 / 3);
-  if (symbols.length < metadataLengthSymbolCount) return null;
+  if (symbols.length < metadataLengthSymbolCount) {
+    return { status: 'header-invalid', headerValid: false, crcValid: null, packet: null, reason: 'Not enough symbols to read the packet metadata length.' };
+  }
   const metadataHeader = decode3BitPayload(symbols.subarray(0, metadataLengthSymbolCount), (metadataLengthOffset + 1) * 8);
   const metadataLength = metadataHeader[metadataLengthOffset];
   const packetLength = metadataLengthOffset + 1 + metadataLength + blockSize + 4;
   const packetSymbolCount = Math.ceil(packetLength * 8 / 3);
-  if (symbols.length < packetSymbolCount) return null;
+  if (symbols.length < packetSymbolCount) {
+    return { status: 'header-invalid', headerValid: false, crcValid: null, packet: null, reason: 'Packet payload is truncated.' };
+  }
 
   const packet = decode3BitPayload(symbols.subarray(0, packetSymbolCount), packetLength * 8);
   const checksumOffset = packetLength - 4;
-  if (readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), checksumOffset) !== crc32(packet.subarray(0, checksumOffset))) return null;
-  return packet;
+  if (readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), checksumOffset) !== crc32(packet.subarray(0, checksumOffset))) {
+    return { status: 'crc-failed', headerValid: true, crcValid: false, packet: null, reason: 'Packet CRC32 did not match.' };
+  }
+  return { status: 'decoded', headerValid: true, crcValid: true, packet, reason: null };
+}
+
+export function decode3BitPacket(symbols: Uint8Array): Uint8Array | null {
+  return decode3BitPacketDetailed(symbols).packet;
 }
 
 export function robustSolitonDegree(seed: number, blockCount: number): number {
@@ -475,7 +499,15 @@ export function createAztecLayout(targetMatrixSize: number): AztecLayout {
       if (!onPerimeter && grid[y][x] === null) dataCoordinates.push([x, y]);
     }
   }
-  return { targetMatrixSize: size, frameSize: size * MODULE_PIXELS, dataCoordinates, alignmentCoordinates, grid };
+  const matrixOffset = QUIET_ZONE_MODULES * MODULE_PIXELS;
+  return {
+    targetMatrixSize: size,
+    frameSize: (size + QUIET_ZONE_MODULES * 2) * MODULE_PIXELS,
+    matrixOffset,
+    dataCoordinates,
+    alignmentCoordinates,
+    grid,
+  };
 }
 
 function packetCapacity(layout: AztecLayout): number {
@@ -577,43 +609,75 @@ function isPalette(x: number, y: number): boolean {
   return y === PALETTE_Y && x < COLORS.length;
 }
 
-export function drawAztecFrame(packet: Uint8Array, canvas: HTMLCanvasElement, targetMatrixSize: number): void {
+export interface AztecFrameRenderResult {
+  frameId: number;
+  changedModules: number;
+  totalModules: number;
+  width: number;
+  height: number;
+}
+
+export function renderAztecFrameMatrix(packet: Uint8Array, targetMatrixSize: number): Uint8Array {
   const layout = createAztecLayout(targetMatrixSize);
-  const context = canvas.getContext('2d');
-  if (!context) throw new Error('Canvas rendering is unavailable.');
-  canvas.width = layout.frameSize;
-  canvas.height = layout.frameSize;
   const symbols = encode3BitPayload(packet);
   if (symbols.length > layout.dataCoordinates.length) {
     throw new Error(`Packet requires ${symbols.length} data modules, but the ${targetMatrixSize}x${targetMatrixSize} matrix has room for ${layout.dataCoordinates.length}.`);
   }
-  const values = new Uint8Array(layout.dataCoordinates.length);
-  for (let index = 0; index < values.length; index += 1) {
-    values[index] = ((symbols[index] ?? 0) ^ colorSymbolMask(index)) & 0x7;
+  const matrix = new Uint8Array(layout.targetMatrixSize * layout.targetMatrixSize);
+  for (let y = 0; y < layout.targetMatrixSize; y += 1) {
+    for (let x = 0; x < layout.targetMatrixSize; x += 1) {
+      const structural = layout.grid[y][x];
+      matrix[y * layout.targetMatrixSize + x] = structural === null ? 7 : COLORS.indexOf(structural as typeof COLORS[number]);
+    }
   }
-  const draw = (x: number, y: number, color: string) => {
-    context.fillStyle = color;
-    context.fillRect(x * MODULE_PIXELS, y * MODULE_PIXELS, MODULE_PIXELS, MODULE_PIXELS);
-  };
+  const frameId = packet.length >= 4 ? readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), 0) : 0;
+  for (let index = 0; index < layout.dataCoordinates.length; index += 1) {
+    const [x, y] = layout.dataCoordinates[index];
+    let symbol = symbols[index] ?? 0;
+    if (index >= symbols.length) {
+      let state = (frameId ^ Math.imul(index + 1, 0x9e3779b9)) >>> 0;
+      state = (Math.imul(state ^ (state >>> 16), 0x45d9f3b) + 0x27100001) >>> 0;
+      state ^= state >>> 13;
+      symbol = state & 0x7;
+    }
+    matrix[y * layout.targetMatrixSize + x] = (symbol ^ colorSymbolMask(index)) & 0x7;
+  }
+  return matrix;
+}
+
+export function drawAztecFrame(packet: Uint8Array, canvas: HTMLCanvasElement, targetMatrixSize: number): AztecFrameRenderResult {
+  const layout = createAztecLayout(targetMatrixSize);
+  const matrix = renderAztecFrameMatrix(packet, targetMatrixSize);
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Canvas rendering is unavailable.');
+  if (canvas.width !== layout.frameSize) canvas.width = layout.frameSize;
+  if (canvas.height !== layout.frameSize) canvas.height = layout.frameSize;
+  context.clearRect(0, 0, layout.frameSize, layout.frameSize);
   context.fillStyle = '#FFFFFF';
   context.fillRect(0, 0, layout.frameSize, layout.frameSize);
   for (let y = 0; y < layout.targetMatrixSize; y += 1) {
     for (let x = 0; x < layout.targetMatrixSize; x += 1) {
-      const structural = layout.grid[y][x];
-      if (structural !== null) draw(x, y, structural);
+      context.fillStyle = COLORS[matrix[y * layout.targetMatrixSize + x]];
+      context.fillRect(
+        layout.matrixOffset + x * MODULE_PIXELS,
+        layout.matrixOffset + y * MODULE_PIXELS,
+        MODULE_PIXELS,
+        MODULE_PIXELS,
+      );
     }
   }
-  for (let index = 0; index < layout.dataCoordinates.length; index += 1) {
-    const [x, y] = layout.dataCoordinates[index];
-    if (x < 1 || x >= layout.targetMatrixSize - 1 || y < 1 || y >= layout.targetMatrixSize - 1) continue;
-    draw(x, y, COLORS[values[index]]);
+  const previous = renderedMatrices.get(canvas);
+  let changedModules = matrix.length;
+  if (previous && previous.length === matrix.length) {
+    changedModules = 0;
+    for (let index = 0; index < matrix.length; index += 1) {
+      if (matrix[index] !== previous[index]) changedModules += 1;
+    }
   }
-  context.fillStyle = '#000000';
-  context.fillRect(0, 0, layout.frameSize, 3);
-  context.fillRect(0, layout.frameSize - 3, layout.frameSize, 3);
-  context.fillRect(0, 0, 3, layout.frameSize);
-  context.fillRect(layout.frameSize - 3, 0, 3, layout.frameSize);
-  context.imageSmoothingEnabled = false;
+  renderedMatrices.set(canvas, matrix);
+  return { frameId: packet.length >= 4 ? readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), 0) : 0, changedModules, totalModules: matrix.length, width: canvas.width, height: canvas.height };
 }
+
+const renderedMatrices = new WeakMap<HTMLCanvasElement, Uint8Array>();
 
 export { HEADER_BYTES, readU16, readU32, xorInto };

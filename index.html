@@ -21,7 +21,19 @@
     .meta { min-height: 22px; text-align: center; }
     .telemetry { color: #7fffd4; font-family: ui-monospace, monospace; font-size: .85rem; }
     #tx { display: block; width: min(92vw, 570px); height: min(92vw, 570px); max-width: 100%; background: #fff; image-rendering: pixelated; }
-    #camera { width: min(100%, 720px); max-height: 65vh; background: #111; object-fit: contain; }
+    #cameraPreview { position: relative; width: min(100%, 720px); background: #111; }
+    #camera { display: block; width: 100%; max-height: 65vh; object-fit: contain; }
+    #diagnosticOverlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    #previewStatus { position: absolute; left: 8px; top: 8px; padding: 4px 8px; background: #000c; color: #fff; font: 12px ui-monospace, monospace; pointer-events: none; }
+    .diagnostics { width: min(100%, 720px); display: grid; gap: 8px; }
+    .diagnostics h2 { margin: 4px 0; font-size: 1.1rem; }
+    .diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 5px 12px; }
+    .diagnostic-grid div { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid #333; padding: 4px; }
+    .diagnostic-grid dt { color: #aaa; }
+    .diagnostic-grid dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+    .diagnostic-error { color: #ff9a9a; overflow-wrap: anywhere; }
+    .test-controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    .test-controls input { max-width: 100%; }
     #receivePreview img, #receivePreview video { max-width: min(100%, 480px); max-height: 55vh; }
     #scanCanvas { display: none; }
     [hidden] { display: none !important; }
@@ -50,18 +62,49 @@
       <div id="sendStatus" class="meta">Choose a file</div>
       <div id="frameCount" class="meta"></div>
       <div id="sendFileName" class="meta"></div>
-      <div id="transmitTelemetry" class="meta telemetry">0 data bits | 0 padded modules | 0 rings</div>
+      <div id="transmitTelemetry" class="meta telemetry">Frame — | FPS — | Idle | Canvas — | Matrix change —</div>
       <canvas id="tx" aria-label="Current scalable color transfer frame"></canvas>
     </section>
 
     <section id="receivePanel" class="panel" aria-labelledby="receiveTab" hidden>
-      <video id="camera" playsinline muted></video>
+      <div id="cameraPreview">
+        <video id="camera" playsinline muted></video>
+        <canvas id="diagnosticOverlay" aria-hidden="true"></canvas>
+        <div id="previewStatus">WAITING — camera off</div>
+      </div>
       <label for="zoomSlider">Camera zoom
         <input id="zoomSlider" type="range" min="1" max="1" step="0.1" value="1" disabled>
       </label>
       <button id="startButton" type="button">Start camera</button>
       <div id="receiveStatus" class="meta">Ready - press Start camera; scans calibrated color packets</div>
       <div id="zoomHelp" class="meta">Camera zoom support is checked when the camera starts.</div>
+      <div class="test-controls">
+        <button id="decoderTestButton" type="button">Run decoder self-test</button>
+        <label>Decode saved frame <input id="savedFrameInput" type="file" accept="image/*"></label>
+      </div>
+      <div id="decoderTestStatus" class="meta" aria-live="polite">Self-test uses the production renderer, decoder, CRC and reconstruction worker.</div>
+      <section class="diagnostics" aria-labelledby="diagnosticHeading">
+        <h2 id="diagnosticHeading">Receiver diagnostics</h2>
+        <dl class="diagnostic-grid">
+          <div><dt>Camera</dt><dd id="diagCamera">WAITING</dd></div>
+          <div><dt>Camera frames</dt><dd id="diagFrames">0 received</dd></div>
+          <div><dt>Image processing</dt><dd id="diagProcessing">0 processed</dd></div>
+          <div><dt>Candidate detection</dt><dd id="diagCandidates">0 candidates</dd></div>
+          <div><dt>Geometry</dt><dd id="diagGeometry">WAITING</dd></div>
+          <div><dt>Orientation</dt><dd id="diagOrientation">WAITING</dd></div>
+          <div><dt>Grid sampling</dt><dd id="diagGrid">WAITING</dd></div>
+          <div><dt>Colour recognition</dt><dd id="diagColour">WAITING</dd></div>
+          <div><dt>Header validation</dt><dd id="diagHeader">WAITING</dd></div>
+          <div><dt>CRC validation</dt><dd id="diagCrc">WAITING</dd></div>
+          <div><dt>Packet decoding</dt><dd id="diagPackets">0 accepted</dd></div>
+          <div><dt>Reconstruction</dt><dd id="diagReconstruction">0 blocks</dd></div>
+          <div><dt>File verification</dt><dd id="diagVerification">WAITING</dd></div>
+          <div><dt>Last detection</dt><dd id="diagLastDetection">Never</dd></div>
+          <div><dt>Last packet ID</dt><dd id="diagLastPacket">—</dd></div>
+          <div><dt>Rejected candidates / packets</dt><dd id="diagRejected">0 / 0</dd></div>
+        </dl>
+        <div id="diagLatestError" class="diagnostic-error" role="status">Most recent error: none</div>
+      </section>
       <div class="meta">Mobile Chrome requires HTTPS for camera access.</div>
       <div id="receiveProgress" class="meta"></div>
       <div id="receiveFileName" class="meta"></div>

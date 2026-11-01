@@ -1,7 +1,7 @@
 import { crc32, FountainEquationSolver, MAX_BLOCK_COUNT, MAX_EQUATION_DEGREE, MAX_FILE_BYTES, readU16, readU32, sha256Hex } from './aztec';
-import { decodeOpticalFrame } from './image-decoder';
-import type { FrameCorners, PixelImage } from './image-decoder';
-import { WorkerRequest, WorkerResponse } from './worker-protocol';
+import { decodeOpticalFrameDetailed } from './image-decoder';
+import type { DecoderTrace, FrameCorners, PixelImage } from './image-decoder';
+import type { WorkerDiagnostics, WorkerRequest, WorkerResponse } from './worker-protocol';
 
 let lastSession: number | null = null;
 let decodedCount = 0;
@@ -13,8 +13,26 @@ let totalBytes = 0;
 let metadata: { name: string; type: string; hash: string } | null = null;
 let targetMatrixSize = 63;
 let lastCorners: FrameCorners | null = null;
-let lastDiagnosticAt = 0;
-const diagnosticCounts = { frames: 0, pixels: 0, packets: 0, invalidPackets: 0 };
+let latestTrace: DecoderTrace | null = null;
+const diagnosticCounts: WorkerDiagnostics = {
+  frames: 0,
+  pixels: 0,
+  packets: 0,
+  invalidPackets: 0,
+  candidatesDetected: 0,
+  validGeometry: 0,
+  orientationsFound: 0,
+  gridsSampled: 0,
+  headerValidations: 0,
+  crcPasses: 0,
+  rejectedCandidates: 0,
+  rejectedPackets: 0,
+  uniqueBlocks: 0,
+  lastPacketId: null,
+  lastDetectionTimestamp: null,
+  verification: 'WAITING',
+  latestError: null,
+};
 const receivedFrames = new Set<number>();
 let solver: FountainEquationSolver | null = null;
 
@@ -22,11 +40,55 @@ function postWorkerMessage(message: WorkerResponse, transfer?: Transferable[]): 
   (self as unknown as { postMessage(value: WorkerResponse, transfer?: Transferable[]): void }).postMessage(message, transfer);
 }
 
-function reportDiagnostic(code: string): void {
-  const now = Date.now();
-  if (now - lastDiagnosticAt < 500) return;
-  lastDiagnosticAt = now;
-  postWorkerMessage({ type: 'diagnostic', code, counts: { ...diagnosticCounts } });
+function reportDiagnostic(trace: DecoderTrace): void {
+  const { packet: _packet, ...visibleTrace } = trace;
+  postWorkerMessage({ type: 'diagnostic', trace: visibleTrace, counts: { ...diagnosticCounts } });
+}
+
+function resetDiagnostics(): void {
+  diagnosticCounts.frames = 0;
+  diagnosticCounts.pixels = 0;
+  diagnosticCounts.packets = 0;
+  diagnosticCounts.invalidPackets = 0;
+  diagnosticCounts.candidatesDetected = 0;
+  diagnosticCounts.validGeometry = 0;
+  diagnosticCounts.orientationsFound = 0;
+  diagnosticCounts.gridsSampled = 0;
+  diagnosticCounts.headerValidations = 0;
+  diagnosticCounts.crcPasses = 0;
+  diagnosticCounts.rejectedCandidates = 0;
+  diagnosticCounts.rejectedPackets = 0;
+  diagnosticCounts.uniqueBlocks = 0;
+  diagnosticCounts.lastPacketId = null;
+  diagnosticCounts.lastDetectionTimestamp = null;
+  diagnosticCounts.verification = 'WAITING';
+  diagnosticCounts.latestError = null;
+}
+
+function updateTrace(trace: DecoderTrace): void {
+  if (trace.candidateCount > 0) diagnosticCounts.candidatesDetected += trace.candidateCount;
+  if (trace.geometryCandidates > 0) diagnosticCounts.validGeometry += trace.geometryCandidates;
+  if (trace.orientationFound) {
+    diagnosticCounts.orientationsFound += 1;
+    diagnosticCounts.lastDetectionTimestamp = Date.now();
+  }
+  if (trace.gridSampled) diagnosticCounts.gridsSampled += 1;
+  if (trace.headerValid === true) diagnosticCounts.headerValidations += 1;
+  if (trace.crcValid === true) diagnosticCounts.crcPasses += 1;
+  if (trace.status !== 'packet-decoded') {
+    diagnosticCounts.invalidPackets += 1;
+    if (trace.candidateCount > 0) diagnosticCounts.rejectedCandidates += trace.candidateCount;
+    diagnosticCounts.latestError = trace.reason;
+  }
+}
+
+function rejectPacket(trace: DecoderTrace, reason: string, headerValid = false): void {
+  trace.status = 'header-invalid';
+  trace.headerValid = headerValid;
+  trace.reason = reason;
+  diagnosticCounts.rejectedPackets += 1;
+  diagnosticCounts.latestError = reason;
+  reportDiagnostic(trace);
 }
 
 function parsePacket(packet: Uint8Array): { frameId: number; session: number; total: number; count: number; size: number; indices: number[]; data: Uint8Array; metadata: Uint8Array } | null {
@@ -119,10 +181,15 @@ async function completeIfSolved(): Promise<void> {
   const actualHash = await sha256Hex(bytes);
   if (actualHash !== metadata.hash) {
     completionSent = true;
+    diagnosticCounts.verification = 'FAILED';
+    diagnosticCounts.latestError = 'Transfer integrity failure: reconstructed file hash mismatch.';
+    if (latestTrace) reportDiagnostic(latestTrace);
     postWorkerMessage({ type: 'error', message: 'Transfer integrity failure: reconstructed file hash mismatch.' });
     return;
   }
   completionSent = true;
+  diagnosticCounts.verification = 'VERIFIED';
+  if (latestTrace) reportDiagnostic(latestTrace);
   postWorkerMessage({
     type: 'complete',
     bytes,
@@ -140,30 +207,34 @@ async function publish(image: PixelImage): Promise<void> {
   diagnosticCounts.frames += 1;
   diagnosticCounts.pixels += image.width * image.height;
   if (completionSent) return;
-  let decoded = lastCorners ? decodeOpticalFrame(image, targetMatrixSize, lastCorners) : null;
-  if (!lastCorners || diagnosticCounts.frames % 5 === 0) {
-    const detected = decodeOpticalFrame(image, targetMatrixSize);
-    if (detected) decoded = detected;
-  }
-  if (!decoded) {
-    diagnosticCounts.invalidPackets += 1;
-    reportDiagnostic('FRAME_NOT_DECODED');
+  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, lastCorners);
+  latestTrace = trace;
+  updateTrace(trace);
+  if (!trace.packet) {
+    reportDiagnostic(trace);
     return;
   }
-  lastCorners = decoded.corners;
-  const parsed = parsePacket(decoded.packet);
+  if (trace.corners) lastCorners = trace.corners;
+  const parsed = parsePacket(trace.packet);
   if (!parsed) {
-    diagnosticCounts.invalidPackets += 1;
-    reportDiagnostic('PACKET_INVALID_OR_CHECKSUM_FAILED');
+    rejectPacket(trace, 'Decoded packet failed structural header validation (size, block count, indices, or payload length).', true);
     return;
   }
-  diagnosticCounts.packets += 1;
 
   if (lastSession !== null && parsed.session !== lastSession) resetSession(parsed.session);
   if (lastSession === null) resetSession(parsed.session);
-  if (parsed.count !== blockCount && blockCount !== 0) return;
-  if (parsed.size !== blockSize && blockSize !== 0) return;
-  if (parsed.total !== totalBytes && blockCount !== 0) return;
+  if (parsed.count !== blockCount && blockCount !== 0) {
+    rejectPacket(trace, 'Packet block count does not match the active transfer.', true);
+    return;
+  }
+  if (parsed.size !== blockSize && blockSize !== 0) {
+    rejectPacket(trace, 'Packet block size does not match the active transfer.', true);
+    return;
+  }
+  if (parsed.total !== totalBytes && blockCount !== 0) {
+    rejectPacket(trace, 'Packet file size does not match the active transfer.', true);
+    return;
+  }
   if (blockCount === 0) {
     blockCount = parsed.count;
     blockSize = parsed.size;
@@ -172,23 +243,32 @@ async function publish(image: PixelImage): Promise<void> {
   if (parsed.metadata[0] === 1) {
     const parsedMetadata = parseMetadata(parsed.metadata);
     if (!parsedMetadata) {
-      reportDiagnostic('TRANSFER_METADATA_INVALID');
+      rejectPacket(trace, 'Transfer metadata is malformed or contains an invalid UTF-8 name, MIME type, or SHA-256 digest.', true);
       return;
     }
     metadata = parsedMetadata;
   } else if (parsed.metadata.length !== 1 || parsed.metadata[0] !== 0) {
-    reportDiagnostic('PACKET_METADATA_INVALID');
+    rejectPacket(trace, 'Packet metadata flag or length is invalid.', true);
     return;
   }
   if (!solver) solver = new FountainEquationSolver(blockCount, blockSize);
-  if (receivedFrames.has(parsed.frameId)) return;
+  if (receivedFrames.has(parsed.frameId)) {
+    reportDiagnostic(trace);
+    return;
+  }
   if (!solver.addEquation(parsed.indices, parsed.data)) {
-    reportDiagnostic('FOUNTAIN_EQUATION_REJECTED');
+    rejectPacket(trace, 'Fountain equation conflicts with already received packet data.', true);
     return;
   }
   receivedFrames.add(parsed.frameId);
   decodedCount += 1;
+  diagnosticCounts.packets += 1;
+  diagnosticCounts.lastPacketId = parsed.frameId;
+  diagnosticCounts.uniqueBlocks = solver.solved.size;
+  diagnosticCounts.verification = 'IN_PROGRESS';
+  reportDiagnostic(trace);
   await completeIfSolved();
+  diagnosticCounts.uniqueBlocks = solver.solved.size;
   postWorkerMessage({
     type: 'packet',
     frameId: parsed.frameId,
@@ -213,10 +293,8 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     resetSession(0);
     lastSession = null;
     lastCorners = null;
-    diagnosticCounts.frames = 0;
-    diagnosticCounts.pixels = 0;
-    diagnosticCounts.packets = 0;
-    diagnosticCounts.invalidPackets = 0;
+    latestTrace = null;
+    resetDiagnostics();
     running = true;
     return;
   }

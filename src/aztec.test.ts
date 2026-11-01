@@ -1,16 +1,67 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { COLORS, colorSymbolMask, createAztecLayout, crc32, decode3BitPacket, decode3BitPayload, encode3BitPayload, FountainEquationSolver, MAX_FILE_BYTES, prepareAztecTransfer, sha256Hex, solveFountainEquations } from './aztec.ts';
-import { decodeOpticalFrame } from './image-decoder.ts';
+import { COLORS, colorSymbolMask, createAztecLayout, crc32, decode3BitPacket, decode3BitPayload, drawAztecFrame, encode3BitPayload, FountainEquationSolver, MAX_FILE_BYTES, prepareAztecTransfer, renderAztecFrameMatrix, sha256Hex, solveFountainEquations } from './aztec.ts';
+import { decodeOpticalFrame, decodeOpticalFrameDetailed } from './image-decoder.ts';
 import type { PixelImage } from './image-decoder.ts';
 
-function makePayload(length: number, seed: number): Uint8Array {
+function makePayload(length: number, seed: number): Uint8Array<ArrayBuffer> {
   const bytes = new Uint8Array(length);
   for (let index = 0; index < length; index += 1) {
     bytes[index] = (index * 37 + seed) & 0xff;
   }
   return bytes;
+}
+
+function makeRenderedImage(packet: Uint8Array, matrixSize: number): PixelImage {
+  const layout = createAztecLayout(matrixSize);
+  const matrix = renderAztecFrameMatrix(packet, matrixSize);
+  const modulePixels = 6;
+  const width = layout.frameSize;
+  const data = new Uint8ClampedArray(width * width * 4);
+  data.fill(255);
+  const rgb = COLORS.map((color) => [
+    parseInt(color.slice(1, 3), 16),
+    parseInt(color.slice(3, 5), 16),
+    parseInt(color.slice(5, 7), 16),
+  ]);
+  for (let y = 0; y < width; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const matrixX = Math.floor((x - layout.matrixOffset) / modulePixels);
+      const matrixY = Math.floor((y - layout.matrixOffset) / modulePixels);
+      if (matrixX < 0 || matrixX >= matrixSize || matrixY < 0 || matrixY >= matrixSize) continue;
+      const color = rgb[matrix[matrixY * matrixSize + matrixX]];
+      const offset = (y * width + x) * 4;
+      data[offset] = color[0];
+      data[offset + 1] = color[1];
+      data[offset + 2] = color[2];
+      data[offset + 3] = 255;
+    }
+  }
+  return { width, height: width, data };
+}
+
+function scaleBrightness(image: PixelImage, multiplier: number): PixelImage {
+  const data = new Uint8ClampedArray(image.data);
+  for (let index = 0; index < data.length; index += 4) {
+    data[index] = Math.min(255, data[index] * multiplier);
+    data[index + 1] = Math.min(255, data[index + 1] * multiplier);
+    data[index + 2] = Math.min(255, data[index + 2] * multiplier);
+  }
+  return { width: image.width, height: image.height, data };
+}
+
+function addDarkCameraBackground(image: PixelImage, size: number): PixelImage {
+  const data = new Uint8ClampedArray(size * size * 4);
+  for (let index = 0; index < size * size; index += 1) data[index * 4 + 3] = 255;
+  const left = Math.floor((size - image.width) / 2);
+  const top = Math.floor((size - image.height) / 2);
+  for (let y = 0; y < image.height; y += 1) {
+    const sourceStart = y * image.width * 4;
+    const targetStart = ((top + y) * size + left) * 4;
+    data.set(image.data.subarray(sourceStart, sourceStart + image.width * 4), targetStart);
+  }
+  return { width: size, height: size, data };
 }
 
 function makeOpticalFrame(packet: Uint8Array, matrixSize: number, rotation = 0): PixelImage {
@@ -170,6 +221,109 @@ test('packet decoding ignores padded color modules and preserves the exact packe
   assert.equal(decode3BitPacket(corruptedSymbols), null, 'a corrupted packet must fail its CRC');
 });
 
+test('renderer redraws every module and changes frame-dependent padding', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(200, 19)], 'render.bin'), 63);
+  const firstPacket = transfer.packets[0];
+  const nextPacket = transfer.packets[1];
+  const size = transfer.targetMatrixSize;
+  const canvas = {
+    width: 0,
+    height: 0,
+    getContext: () => context,
+  } as unknown as HTMLCanvasElement;
+  let fillStyle = '';
+  let draws = new Map<number, string>();
+  const context = {
+    clearRect: () => { draws = new Map<number, string>(); },
+    fillRect: (x: number, y: number, width: number, height: number) => {
+      if (width !== 6 || height !== 6) return;
+      assert.equal(width, 6);
+      assert.equal(height, 6);
+      draws.set(((y - 12) / 6) * size + (x - 12) / 6, fillStyle);
+    },
+    set fillStyle(value: string) { fillStyle = value; },
+    get fillStyle() { return fillStyle; },
+  } as unknown as CanvasRenderingContext2D;
+
+  const first = drawAztecFrame(firstPacket, canvas, size);
+  const firstMatrix = renderAztecFrameMatrix(firstPacket, size);
+  assert.equal(first.width, (size + 4) * 6);
+  assert.equal(first.height, (size + 4) * 6);
+  assert.equal(draws.size, size * size, 'every matrix module, including corners, must be redrawn');
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      assert.equal(draws.get(y * size + x), COLORS[firstMatrix[y * size + x]]);
+    }
+  }
+  assert.equal(firstMatrix[0], 0);
+  assert.equal(firstMatrix[size - 1], 0);
+  assert.equal(firstMatrix[(size - 1) * size], 0);
+  assert.equal(firstMatrix[size * size - 1], 0);
+
+  const second = drawAztecFrame(nextPacket, canvas, size);
+  const secondMatrix = renderAztecFrameMatrix(nextPacket, size);
+  assert.equal(draws.size, size * size, 'the next frame must also redraw the complete matrix');
+  assert.ok(second.changedModules > size * size * 0.25, 'a new frame must replace stale symbols across the data region');
+  assert.equal(second.totalModules, size * size);
+  assert.notDeepEqual(firstMatrix, secondMatrix);
+});
+
+test('actual sender render decodes in the receiver pipeline at varied brightness', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(128, 77)], 'self-test.bin'), 63);
+  const image = makeRenderedImage(transfer.packets[0], transfer.targetMatrixSize);
+  const palette = new Set(renderAztecFrameMatrix(transfer.packets[0], transfer.targetMatrixSize));
+  assert.equal(palette.size, 8, 'the rendered frame must contain every protocol palette colour');
+  for (const brightness of [0.7, 1, 1.15]) {
+    const trace = decodeOpticalFrameDetailed(scaleBrightness(image, brightness), transfer.targetMatrixSize);
+    assert.equal(trace.status, 'packet-decoded', `decoder failed at brightness multiplier ${brightness}: ${trace.reason}`);
+    assert.equal(trace.geometryCandidates, 1);
+    assert.equal(trace.orientationFound, true);
+    assert.equal(trace.gridSampled, true);
+    assert.equal(trace.recognizedModules, trace.totalModules);
+    assert.equal(trace.headerValid, true);
+    assert.equal(trace.crcValid, true);
+    assert.deepStrictEqual(trace.packet, transfer.packets[0]);
+  }
+  const darkRoomTrace = decodeOpticalFrameDetailed(addDarkCameraBackground(image, 720), transfer.targetMatrixSize);
+  assert.equal(darkRoomTrace.status, 'packet-decoded', `quiet zone should separate the matrix from a dark screen background: ${darkRoomTrace.reason}`);
+  assert.deepStrictEqual(darkRoomTrace.packet, transfer.packets[0]);
+});
+
+test('receiver diagnostics distinguish absent candidates, bad geometry, and CRC failures', async () => {
+  const size = 240;
+  const white = new Uint8ClampedArray(size * size * 4);
+  for (let index = 0; index < size * size; index += 1) {
+    white[index * 4] = 255;
+    white[index * 4 + 1] = 255;
+    white[index * 4 + 2] = 255;
+    white[index * 4 + 3] = 255;
+  }
+  const noCandidate = decodeOpticalFrameDetailed({ width: size, height: size, data: white }, 63);
+  assert.equal(noCandidate.status, 'candidate-not-found');
+  assert.match(noCandidate.reason, /No square dark frame boundary/);
+
+  for (let y = 70; y < 130; y += 1) {
+    for (let x = 70; x < 130; x += 1) {
+      const offset = (y * size + x) * 4;
+      white[offset] = 0;
+      white[offset + 1] = 0;
+      white[offset + 2] = 0;
+    }
+  }
+  const badGeometry = decodeOpticalFrameDetailed({ width: size, height: size, data: white }, 63);
+  assert.equal(badGeometry.status, 'geometry-failed');
+  assert.match(badGeometry.reason, /covers less than 8%/);
+
+  const transfer = await prepareAztecTransfer(new File([makePayload(32, 90)], 'crc.bin'), 63);
+  const corrupted = transfer.packets[0].slice();
+  corrupted[corrupted.length - 5] ^= 0x80;
+  const crcTrace = decodeOpticalFrameDetailed(makeRenderedImage(corrupted, 63), 63);
+  assert.equal(crcTrace.status, 'crc-failed');
+  assert.equal(crcTrace.headerValid, true);
+  assert.equal(crcTrace.crcValid, false);
+  assert.match(crcTrace.reason, /CRC32/);
+});
+
 test('empty files and UTF-8 filenames retain valid packet metadata', async () => {
   const file = new File([], '資料-🧪.bin', { type: 'application/octet-stream' });
   const transfer = await prepareAztecTransfer(file, 63);
@@ -234,6 +388,32 @@ test('SHA-256 digest is deterministic and hex-encoded', async () => {
   assert.equal(digest.length, 64);
   assert.equal(await sha256Hex(bytes), digest);
   assert.notEqual(digest, '');
+});
+
+test('valid optical packet reaches reconstruction and verifies the complete file hash', async () => {
+  const source = makePayload(64, 33);
+  const file = new File([source], 'verified.bin', { type: 'application/octet-stream' });
+  const transfer = await prepareAztecTransfer(file, 63);
+  const trace = decodeOpticalFrameDetailed(makeRenderedImage(transfer.packets[0], 63), 63);
+  assert.equal(trace.status, 'packet-decoded');
+  assert.ok(trace.packet);
+  const packet = trace.packet;
+  const degree = packet[20];
+  let offset = 21 + degree * 2;
+  const metadataLength = packet[offset++];
+  const metadata = packet.subarray(offset, offset + metadataLength);
+  const nameLength = metadata[1];
+  const typeLengthOffset = 2 + nameLength;
+  const typeLength = metadata[typeLengthOffset];
+  const hashLengthOffset = typeLengthOffset + 1 + typeLength;
+  const expectedHash = new TextDecoder().decode(metadata.subarray(hashLengthOffset + 1));
+  offset += metadataLength;
+  const payload = packet.subarray(offset, offset + transfer.blockSize);
+  const solver = new FountainEquationSolver(transfer.blockCount, transfer.blockSize);
+  assert.equal(solver.addEquation([0], payload), true);
+  const reconstructed = solver.solved.get(0)?.subarray(0, source.length);
+  assert.deepStrictEqual(reconstructed, source);
+  assert.equal(await sha256Hex(reconstructed ?? new Uint8Array()), expectedHash);
 });
 
 test('fountain packets recover files through realistic packet-loss patterns', async () => {

@@ -1,3 +1,5 @@
+import type { DecoderTrace } from './image-decoder';
+
 export type WorkerRequest =
   | { type: 'start'; targetMatrixSize: number }
   | { type: 'frame'; pixels: ImageData }
@@ -8,11 +10,24 @@ export type WorkerDiagnostics = {
   pixels: number;
   packets: number;
   invalidPackets: number;
+  candidatesDetected: number;
+  validGeometry: number;
+  orientationsFound: number;
+  gridsSampled: number;
+  headerValidations: number;
+  crcPasses: number;
+  rejectedCandidates: number;
+  rejectedPackets: number;
+  uniqueBlocks: number;
+  lastPacketId: number | null;
+  lastDetectionTimestamp: number | null;
+  verification: 'WAITING' | 'IN_PROGRESS' | 'VERIFIED' | 'FAILED';
+  latestError: string | null;
 };
 
 export type WorkerResponse =
   | { type: 'packet'; frameId: number; session: number; decodedCount: number; blockCount: number; solved: number; name?: string }
   | { type: 'frameDone'; timestamp: number; counts: WorkerDiagnostics }
-  | { type: 'diagnostic'; code: string; counts: WorkerDiagnostics }
+  | { type: 'diagnostic'; trace: Omit<DecoderTrace, 'packet'>; counts: WorkerDiagnostics }
   | { type: 'complete'; bytes: Uint8Array; name: string; mime: string; expectedHash: string; verified: true; unique: number; solved: number }
   | { type: 'error'; message: string };

@@ -1,4 +1,4 @@
-import { COLORS, colorSymbolMask, createAztecLayout, decode3BitPacket } from './aztec.ts';
+import { COLORS, colorSymbolMask, createAztecLayout, decode3BitPacketDetailed } from './aztec.ts';
 import type { AztecLayout } from './aztec.ts';
 
 export interface PixelImage {
@@ -14,6 +14,25 @@ export interface FramePoint {
 
 export type FrameCorners = [FramePoint, FramePoint, FramePoint, FramePoint];
 
+export interface DecoderTrace {
+  status: 'candidate-not-found' | 'geometry-failed' | 'orientation-failed' | 'grid-sampling-failed' | 'colour-recognition-failed' | 'header-invalid' | 'crc-failed' | 'packet-decoded';
+  candidateCount: number;
+  imageWidth: number;
+  imageHeight: number;
+  geometryCandidates: number;
+  orientationFound: boolean;
+  gridSampled: boolean;
+  recognizedModules: number;
+  totalModules: number;
+  colourConfidence: number | null;
+  headerValid: boolean | null;
+  crcValid: boolean | null;
+  corners: FrameCorners | null;
+  gridLines: Array<[FramePoint, FramePoint]>;
+  packet: Uint8Array | null;
+  reason: string;
+}
+
 type Transform = (x: number, y: number) => FramePoint;
 type LabColor = [number, number, number];
 
@@ -23,59 +42,131 @@ const paletteRgb = COLORS.map((color) => [
   parseInt(color.slice(5, 7), 16),
 ]);
 
-function findFrameCorners(image: PixelImage): FrameCorners | null {
+function findFrameCandidates(image: PixelImage): FrameCorners[] {
   const step = Math.max(1, Math.floor(Math.min(image.width, image.height) / 480));
-  let topLeft: FramePoint | null = null;
-  let topRight: FramePoint | null = null;
-  let bottomRight: FramePoint | null = null;
-  let bottomLeft: FramePoint | null = null;
-  let minSum = Infinity;
-  let maxSum = -Infinity;
-  let minDifference = Infinity;
-  let maxDifference = -Infinity;
-
-  for (let y = 0; y < image.height; y += step) {
-    for (let x = 0; x < image.width; x += step) {
-      const offset = (y * image.width + x) * 4;
+  const columns = Math.ceil(image.width / step);
+  const rows = Math.ceil(image.height / step);
+  const pixelCount = columns * rows;
+  const dark = new Uint8Array(pixelCount);
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < columns; x += 1) {
+      const sourceX = Math.min(image.width - 1, x * step);
+      const sourceY = Math.min(image.height - 1, y * step);
+      const offset = (sourceY * image.width + sourceX) * 4;
       if (image.data[offset] > 65 || image.data[offset + 1] > 65 || image.data[offset + 2] > 65) continue;
-      const sum = x + y;
-      const difference = x - y;
-      if (sum < minSum) {
-        minSum = sum;
-        topLeft = { x, y };
-      }
-      if (difference > maxDifference) {
-        maxDifference = difference;
-        topRight = { x, y };
-      }
-      if (sum > maxSum) {
-        maxSum = sum;
-        bottomRight = { x, y };
-      }
-      if (difference < minDifference) {
-        minDifference = difference;
-        bottomLeft = { x, y };
-      }
+      dark[y * columns + x] = 1;
     }
   }
 
-  if (!topLeft || !topRight || !bottomRight || !bottomLeft) return null;
-  const corners = [topLeft, topRight, bottomRight, bottomLeft] as const;
+  const queue = new Int32Array(pixelCount);
+  const candidates: Array<{ corners: FrameCorners; score: number }> = [];
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (!dark[start]) continue;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = start;
+    dark[start] = 0;
+    let count = 0;
+    let minX = columns;
+    let maxX = -1;
+    let minY = rows;
+    let maxY = -1;
+    let minSum = Infinity;
+    let maxSum = -Infinity;
+    let minDifference = Infinity;
+    let maxDifference = -Infinity;
+    let topLeft: FramePoint | null = null;
+    let topRight: FramePoint | null = null;
+    let bottomRight: FramePoint | null = null;
+    let bottomLeft: FramePoint | null = null;
+    while (head < tail) {
+      const current = queue[head++];
+      const x = current % columns;
+      const y = Math.floor(current / columns);
+      count += 1;
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+      const point = { x: Math.min(image.width - 1, x * step), y: Math.min(image.height - 1, y * step) };
+      const sum = x + y;
+      const difference = x - y;
+      if (sum < minSum) { minSum = sum; topLeft = point; }
+      if (difference > maxDifference) { maxDifference = difference; topRight = point; }
+      if (sum > maxSum) { maxSum = sum; bottomRight = point; }
+      if (difference < minDifference) { minDifference = difference; bottomLeft = point; }
+      const left = current - 1;
+      if (x > 0 && dark[left]) {
+        dark[left] = 0;
+        queue[tail++] = left;
+      }
+      const right = current + 1;
+      if (x + 1 < columns && dark[right]) {
+        dark[right] = 0;
+        queue[tail++] = right;
+      }
+      const above = current - columns;
+      if (y > 0 && dark[above]) {
+        dark[above] = 0;
+        queue[tail++] = above;
+      }
+      const below = current + columns;
+      if (y + 1 < rows && dark[below]) {
+        dark[below] = 0;
+        queue[tail++] = below;
+      }
+    }
+    if (!topLeft || !topRight || !bottomRight || !bottomLeft) continue;
+    const width = (maxX - minX + 1) * step;
+    const height = (maxY - minY + 1) * step;
+    const areaRatio = width * height / (image.width * image.height);
+    const aspectRatio = width / Math.max(1, height);
+    if (Math.min(width, height) < Math.min(image.width, image.height) * 0.02 ||
+      areaRatio < 0.005 || areaRatio > 0.98 ||
+      aspectRatio < 0.2 || aspectRatio > 5) continue;
+    const density = count / Math.max(1, width * height / (step * step));
+    candidates.push({
+      corners: [topLeft, topRight, bottomRight, bottomLeft],
+      score: areaRatio * (1 - Math.min(1, density)),
+    });
+  }
+  return candidates.sort((a, b) => b.score - a.score).slice(0, 4).map(({ corners }) => corners);
+}
+
+function validateFrameGeometry(image: PixelImage, corners: FrameCorners): string | null {
   const minDimension = Math.min(image.width, image.height);
   for (let index = 0; index < corners.length; index += 1) {
     const current = corners[index];
     const next = corners[(index + 1) % corners.length];
-    if (Math.hypot(current.x - next.x, current.y - next.y) < minDimension * 0.12) return null;
+    if (!Number.isFinite(current.x) || !Number.isFinite(current.y) || current.x < 0 || current.y < 0 || current.x >= image.width || current.y >= image.height) {
+      return 'Candidate corners fall outside the camera image.';
+    }
+    if (Math.hypot(current.x - next.x, current.y - next.y) < minDimension * 0.12) {
+      return 'Candidate is too small or degenerate to contain a matrix.';
+    }
   }
   const area = Math.abs(corners.reduce((sum, point, index) => {
     const next = corners[(index + 1) % corners.length];
     return sum + point.x * next.y - next.x * point.y;
   }, 0)) / 2;
-  if (area < image.width * image.height * 0.08) return null;
+  if (area < image.width * image.height * 0.08) return 'Candidate covers less than 8% of the camera image.';
+  if (area > image.width * image.height * 0.92) return 'Candidate fills more than 92% of the camera image; the full matrix boundary is not isolated.';
   const centerX = corners.reduce((sum, point) => sum + point.x, 0) / 4;
   const centerY = corners.reduce((sum, point) => sum + point.y, 0) / 4;
-  if (Math.abs(centerX - image.width / 2) > image.width * 0.35 || Math.abs(centerY - image.height / 2) > image.height * 0.35) return null;
-  return [...corners];
+  if (Math.abs(centerX - image.width / 2) > image.width * 0.35 || Math.abs(centerY - image.height / 2) > image.height * 0.35) {
+    return 'Candidate is too far from the center of the camera image.';
+  }
+  let crossSign = 0;
+  for (let index = 0; index < corners.length; index += 1) {
+    const current = corners[index];
+    const next = corners[(index + 1) % corners.length];
+    const after = corners[(index + 2) % corners.length];
+    const cross = (next.x - current.x) * (after.y - next.y) - (next.y - current.y) * (after.x - next.x);
+    if (Math.abs(cross) < 1e-6) return 'Candidate edges do not define a stable quadrilateral.';
+    if (crossSign !== 0 && Math.sign(cross) !== crossSign) return 'Candidate corners do not form a convex quadrilateral.';
+    crossSign = Math.sign(cross);
+  }
+  return null;
 }
 
 function createTransform(corners: FrameCorners, size: number): Transform | null {
@@ -174,9 +265,47 @@ function nearestPaletteColor(color: [number, number, number], referenceLabs: Lab
   return { index: bestIndex, nearest, margin: secondNearest - nearest };
 }
 
-function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameCorners): Uint8Array | null {
+function makeGridLines(transform: Transform, size: number): Array<[FramePoint, FramePoint]> {
+  const lines: Array<[FramePoint, FramePoint]> = [];
+  for (let division = 0; division <= 8; division += 1) {
+    const position = size * division / 8;
+    lines.push([transform(position, 0), transform(position, size)]);
+    lines.push([transform(0, position), transform(size, position)]);
+  }
+  return lines;
+}
+
+function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameCorners): DecoderTrace {
+  const base: DecoderTrace = {
+    status: 'geometry-failed',
+    candidateCount: 1,
+    imageWidth: image.width,
+    imageHeight: image.height,
+    geometryCandidates: 0,
+    orientationFound: false,
+    gridSampled: false,
+    recognizedModules: 0,
+    totalModules: layout.dataCoordinates.length,
+    colourConfidence: null,
+    headerValid: null,
+    crcValid: null,
+    corners,
+    gridLines: [],
+    packet: null,
+    reason: '',
+  };
+  const geometryError = validateFrameGeometry(image, corners);
+  if (geometryError) {
+    base.reason = geometryError;
+    return base;
+  }
   const transform = createTransform(corners, layout.targetMatrixSize);
-  if (!transform) return null;
+  if (!transform) {
+    base.reason = 'Perspective transform could not be calculated from the candidate corners.';
+    return base;
+  }
+  base.geometryCandidates = 1;
+  base.gridLines = makeGridLines(transform, layout.targetMatrixSize);
   const references = paletteRgb.map((_, index) => averageColor(image, transform, index + 3, 3));
   const referenceLabs = references.map((reference) => rgbToLab(reference));
   const structural = [...layout.alignmentCoordinates];
@@ -190,31 +319,124 @@ function decodeCandidate(image: PixelImage, layout: AztecLayout, corners: FrameC
     const classified = nearestPaletteColor(averageColor(image, transform, x, y), referenceLabs);
     if (classified.index === expectedIndex && classified.nearest < 55 && classified.margin > 2) matched += 1;
   }
-  if (structural.length === 0 || matched / structural.length < 0.68) return null;
+  const structuralRatio = structural.length === 0 ? 0 : matched / structural.length;
+  if (structuralRatio < 0.68) {
+    base.status = 'orientation-failed';
+    base.reason = `Finder/alignment markers matched ${matched} of ${structural.length} (${(structuralRatio * 100).toFixed(1)}%); 68% is required.`;
+    base.colourConfidence = structuralRatio * 100;
+    return base;
+  }
+  base.orientationFound = true;
 
   const symbols = new Uint8Array(layout.dataCoordinates.length);
+  let recognizedModules = 0;
+  let totalMargin = 0;
+  let firstRejected: { x: number; y: number; distance: number; margin: number } | null = null;
   for (let index = 0; index < layout.dataCoordinates.length; index += 1) {
     const [x, y] = layout.dataCoordinates[index];
     const classified = nearestPaletteColor(averageColor(image, transform, x, y), referenceLabs);
-    if (classified.nearest > 45 || classified.margin < 4) return null;
+    totalMargin += Math.max(0, classified.margin);
+    if (classified.nearest > 45 || classified.margin < 4) {
+      firstRejected ??= { x, y, distance: classified.nearest, margin: classified.margin };
+    } else {
+      recognizedModules += 1;
+    }
     symbols[index] = classified.index ^ colorSymbolMask(index);
   }
-  return decode3BitPacket(symbols);
+  base.gridSampled = true;
+  base.recognizedModules = recognizedModules;
+  base.colourConfidence = totalMargin / Math.max(1, layout.dataCoordinates.length);
+  if (firstRejected) {
+    base.status = 'colour-recognition-failed';
+    base.reason = `Module (${firstRejected.x}, ${firstRejected.y}) is ambiguous: ΔE ${firstRejected.distance.toFixed(1)}, palette margin ${firstRejected.margin.toFixed(1)}; thresholds are 45 and 4.`;
+    return base;
+  }
+
+  const decoded = decode3BitPacketDetailed(symbols);
+  base.headerValid = decoded.headerValid;
+  base.crcValid = decoded.crcValid;
+  base.packet = decoded.packet;
+  base.status = decoded.status === 'crc-failed' ? 'crc-failed' : decoded.status === 'header-invalid' ? 'header-invalid' : 'packet-decoded';
+  base.reason = decoded.reason ?? 'Packet decoded and CRC32 verified.';
+  return base;
 }
 
-export function decodeOpticalFrame(image: PixelImage, targetMatrixSize: number, trackedCorners?: FrameCorners | null): { packet: Uint8Array; corners: FrameCorners } | null {
+export interface OpticalFrameResult {
+  packet: Uint8Array;
+  corners: FrameCorners;
+}
+
+export function decodeOpticalFrameDetailed(image: PixelImage, targetMatrixSize: number, trackedCorners?: FrameCorners | null): DecoderTrace {
   const layout = createAztecLayout(targetMatrixSize);
-  const initialCorners = trackedCorners ?? findFrameCorners(image);
-  if (!initialCorners) return null;
-  const candidates: FrameCorners[] = [];
-  for (let direction of [1, -1]) {
-    for (let start = 0; start < 4; start += 1) {
-      candidates.push(Array.from({ length: 4 }, (_, offset) => initialCorners[(start + direction * offset + 8) % 4]) as FrameCorners);
+  const candidates = findFrameCandidates(image);
+  if (trackedCorners && !candidates.some((candidate) => candidate.every((point, index) =>
+    Math.hypot(point.x - trackedCorners[index].x, point.y - trackedCorners[index].y) < 3))) {
+    candidates.push(trackedCorners);
+  }
+  if (candidates.length === 0) {
+    return {
+      status: 'candidate-not-found',
+      candidateCount: 0,
+      imageWidth: image.width,
+      imageHeight: image.height,
+      geometryCandidates: 0,
+      orientationFound: false,
+      gridSampled: false,
+      recognizedModules: 0,
+      totalModules: layout.dataCoordinates.length,
+      colourConfidence: null,
+      headerValid: null,
+      crcValid: null,
+      corners: null,
+      gridLines: [],
+      packet: null,
+      reason: 'No square dark frame boundary was found in the camera image.',
+    };
+  }
+  const candidateCount = candidates.length;
+  let best: DecoderTrace | null = null;
+  for (const candidate of candidates) {
+    const orientations: FrameCorners[] = [];
+    for (const direction of [1, -1]) {
+      for (let start = 0; start < 4; start += 1) {
+        orientations.push(Array.from({ length: 4 }, (_, offset) => candidate[(start + direction * offset + 8) % 4]) as FrameCorners);
+      }
+    }
+    for (const corners of orientations) {
+      const trace = decodeCandidate(image, layout, corners);
+      trace.candidateCount = candidateCount;
+      if (!best || trace.geometryCandidates > best.geometryCandidates ||
+        (trace.orientationFound && !best.orientationFound) ||
+        (trace.gridSampled && !best.gridSampled) ||
+        trace.recognizedModules > best.recognizedModules) {
+        best = trace;
+      }
+      if (trace.status === 'packet-decoded') return trace;
     }
   }
-  for (const corners of candidates) {
-    const packet = decodeCandidate(image, layout, corners);
-    if (packet) return { packet, corners };
-  }
-  return null;
+  if (best) return best;
+  return {
+    status: 'candidate-not-found',
+    candidateCount: 0,
+    imageWidth: image.width,
+    imageHeight: image.height,
+    geometryCandidates: 0,
+    orientationFound: false,
+    gridSampled: false,
+    recognizedModules: 0,
+    totalModules: layout.dataCoordinates.length,
+    colourConfidence: null,
+    headerValid: null,
+    crcValid: null,
+    corners: null,
+    gridLines: [],
+    packet: null,
+    reason: 'No valid matrix orientation was found.',
+  };
+}
+
+export function decodeOpticalFrame(image: PixelImage, targetMatrixSize: number, trackedCorners?: FrameCorners | null): (OpticalFrameResult & { trace?: DecoderTrace }) | null {
+  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, trackedCorners);
+  if (!trace.packet || !trace.corners) return null;
+  return { packet: trace.packet, corners: trace.corners, trace };
 }

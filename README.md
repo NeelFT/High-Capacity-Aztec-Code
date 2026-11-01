@@ -28,6 +28,12 @@ Open the local HTTPS address printed by Vite. The receiver uses the browser came
 
 The sender includes the original blocks plus repair packets, then repeats the sequence. That gives the receiver another chance to collect missing data if a frame is blurred or missed. A steady, bright screen, a focused camera, and low glare help. Keep the whole frame visible and large in the camera preview; use the camera zoom control if the browser/device offers it. Camera permission requires HTTPS (or localhost), and some mobile browsers restrict camera access when the page is opened from an insecure LAN address.
 
+## Diagnose and test the receiver
+
+The Receive panel reports camera frames, candidate regions, geometry/orientation, sampled colors, header/CRC results, accepted packets, recovered blocks, and final SHA-256 verification. Its preview overlays candidate corners and the estimated grid; the latest decoder error is shown separately.
+
+Use **Run decoder self-test** to generate and render a real packet, then pass its pixels through the production decoder worker and reconstruction path without a second device. To test a camera photo or screenshot, choose **Decode saved frame** and ensure the selected matrix size matches the image. Neither synthetic test proves camera-to-camera transfer; that still requires testing with two devices.
+
 ## Build
 
 ```sh
